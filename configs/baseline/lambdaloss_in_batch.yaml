@@ -1,0 +1,4 @@
+_base_:
+  - ./lambdaloss.yaml
+
+baseline_use_in_batch_negatives: true

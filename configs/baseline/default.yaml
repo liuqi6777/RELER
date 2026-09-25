@@ -1,0 +1,3 @@
+# Default supervised objective used for CL pre-training and CL->CL controls.
+baseline_loss: infonce
+baseline_temperature: 0.03

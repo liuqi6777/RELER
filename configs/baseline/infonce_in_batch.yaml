@@ -1,0 +1,6 @@
+_base_:
+  - ./default.yaml
+
+# Post-training CL control. Other samples' positives are detached when used as
+# cross-query negatives, matching the candidate pool used by in-batch nDCG.
+baseline_use_in_batch_negatives: true

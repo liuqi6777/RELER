@@ -1,0 +1,28 @@
+# Mined retrieval data: {query, pos, neg, [pos_scores], [neg_scores]}.
+# For a directory input, keep one source in each subdirectory. RELER converts each
+# row to one positive plus sampled negatives and batches each source separately.
+data_path: data/train
+
+# Cap each source independently. Strongly recommended: MSMARCO (37GB) / NQ (3.7GB) would
+# otherwise dominate the multi-task mixture. null keeps every sample.
+per_dataset_max_samples: null
+
+q_max_len: 512
+d_max_len: 1024
+
+# Mined negatives carry no graded relevance. Binary uses the selected annotated pos;
+# all other pos texts remain available for cross-query filtering. Graded is rejected.
+relevance_scheme: binary
+
+# Slate construction: 1 positive + (slate_size - 1) negatives per sample.
+slate_size: 8
+# Filename glob selecting which length bucket(s) to read per source. "*.jsonl" reads all.
+# Comma-separated to mix buckets, e.g. "*_len-0-500.jsonl,*_len-500-1000.jsonl".
+file_glob: "*_len-0-500.jsonl,*_len-500-1000.jsonl"
+# When mixing buckets, batch each length range separately (less padding waste). The
+# per-source cap above still applies per source, not per bucket. Off = mixed-length batches.
+batch_per_length_bucket: true
+# Comma-separated source subdirs to include, e.g. "MSMARCO,NQ,HotpotQA". null = all.
+include_sources: null
+# Byte-offset index cache for lazy loading; first run scans each file once, later reuse.
+index_cache_dir: .cache/dataset_index

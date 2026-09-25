@@ -1,0 +1,5 @@
+# Permutation-native own-slate reward. Every teacher-preferred pair whose better
+# document is in the teacher top 10 receives that better rank's log discount.
+# Unlike pseudo-gain nDCG, this consumes only the ordering declared by the teacher.
+reward_type: top_weighted_pairwise
+reward_ndcg_k: 10

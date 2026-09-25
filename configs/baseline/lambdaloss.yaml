@@ -1,0 +1,8 @@
+_base_:
+  - ./default.yaml
+
+# LambdaRank special case of LambdaLoss: pairwise logistic loss weighted by
+# the absolute nDCG@10 change from swapping the two candidates.
+baseline_loss: lambdaloss
+baseline_ndcg_k: 10
+lambdaloss_sigma: 1.0

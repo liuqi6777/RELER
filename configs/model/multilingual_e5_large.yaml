@@ -1,0 +1,8 @@
+# Multilingual-E5 uses mean pooling and asymmetric query/passage prefixes.
+model_name_or_path: intfloat/multilingual-e5-large
+pooling_method: mean
+padding_side: right
+append_token: none
+query_prompt_template: "query: {query}"
+document_prompt_template: "passage: {document}"
+embedding_max_length: 512

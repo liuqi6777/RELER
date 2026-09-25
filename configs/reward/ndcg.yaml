@@ -1,0 +1,3 @@
+# nDCG over the sample's own slate. Keep k at or below the slate size.
+reward_type: ndcg
+reward_ndcg_k: 8

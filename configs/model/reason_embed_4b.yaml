@@ -1,0 +1,8 @@
+model_name_or_path: hanhainebula/reason-embed-qwen3-4b-0928
+pooling_method: last
+padding_side: left
+# tokenizer.json appends endoftext, despite add_eos_token=true in its config.
+append_token: pad
+query_prompt_template: "Instruct: {task_description}\nQuery: {query}"
+document_prompt_template: "{document}"
+embedding_max_length: 8192

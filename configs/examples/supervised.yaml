@@ -1,0 +1,11 @@
+# Minimal RELER supervised example. Change the baseline component to use
+# RankNet or LambdaLoss without changing the training entrypoint.
+_base_:
+  - ../train/full_finetune.yaml
+  - ../dataset/e2rank_listwise.yaml
+  - ../model/qwen3_embedding_0.6b.yaml
+  - ../baseline/infonce_in_batch.yaml
+
+output_dir: checkpoints/reler-supervised
+run_name: reler-supervised
+overwrite_output_dir: false

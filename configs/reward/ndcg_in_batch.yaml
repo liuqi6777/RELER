@@ -1,0 +1,4 @@
+# nDCG over the own slate plus other samples' positive documents.
+reward_type: ndcg_in_batch
+reward_ndcg_k: 16
+ndcg_in_batch_include_negatives: false

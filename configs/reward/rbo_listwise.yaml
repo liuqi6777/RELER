@@ -1,0 +1,6 @@
+# Normalized truncated rank-biased overlap on the own 16-document slate.
+# p=0.9 gives a geometric expected depth of 10; @10 keeps the comparison
+# aligned with the other listwise reward rows.
+reward_type: rbo
+reward_ndcg_k: 10
+reward_rbo_p: 0.9

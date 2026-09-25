@@ -1,0 +1,44 @@
+[project]
+name = "reler"
+version = "0.1.0"
+description = "RELER: reinforcement learning for embedding retrievers"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "accelerate>=1.13.0",
+    "numpy>=1.26",
+    "peft>=0.18.1",
+    "pyyaml>=6.0.2",
+    "torch==2.6.0",
+    "transformers==4.52.3",
+]
+
+[project.optional-dependencies]
+deepspeed = ["deepspeed>=0.18.8"]
+evaluation = ["mteb==1.38.32", "pillow>=10"]
+tracking = ["wandb>=0.25.1"]
+dev = ["mteb==1.38.32", "pillow>=10", "pytest>=8.3", "ruff>=0.11"]
+
+[project.scripts]
+reler-train = "reler.cli:main"
+reler-index = "reler.fixed_corpus.build:main"
+reler-eval = "reler.evaluation.run_mteb:main"
+reler-summarize = "reler.evaluation.summary:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["reler*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

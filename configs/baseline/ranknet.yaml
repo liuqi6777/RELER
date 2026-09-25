@@ -1,0 +1,3 @@
+# Rank-based supervised post-training over every pair in the teacher permutation.
+baseline_loss: ranknet
+baseline_temperature: 0.03

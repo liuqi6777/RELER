@@ -1,0 +1,13 @@
+# Optional endpoint: exact nDCG plus a continuous companion. This is not the
+# primary recipe; normalized_sum makes the weights operate on advantage scale.
+reward_terms:
+  - type: ndcg_in_batch
+    weight: 1.0
+    k: 10
+    include_negatives: false
+  - type: infonce
+    weight: 0.5
+    temperature: 0.03
+    in_batch_negatives: true
+reward_combine: normalized_sum
+advantage_norm: per_component

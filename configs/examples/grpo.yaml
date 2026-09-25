@@ -1,0 +1,11 @@
+# Minimal RELER GRPO example for E2Rank-style listwise data.
+_base_:
+  - ../train/full_finetune.yaml
+  - ../dataset/e2rank_listwise.yaml
+  - ../model/qwen3_embedding_0.6b.yaml
+  - ../grpo/default.yaml
+  - ../reward/ndcg_listwise_in_batch.yaml
+
+output_dir: checkpoints/reler-grpo
+run_name: reler-grpo
+overwrite_output_dir: false

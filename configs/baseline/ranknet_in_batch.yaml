@@ -1,0 +1,6 @@
+_base_:
+  - ./ranknet.yaml
+
+# Post-training ranking control. Other samples' positives are appended with a
+# shared zero label, below the complete teacher-ranked own-query slate.
+baseline_use_in_batch_negatives: true

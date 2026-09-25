@@ -1,0 +1,24 @@
+# Full fine-tuning defaults for embedding post-training.
+bf16: true
+tf32: true
+per_device_train_batch_size: 16
+gradient_checkpointing: true
+gradient_accumulation_steps: 1
+learning_rate: 0.000005
+warmup_ratio: 0.03
+lr_scheduler_type: linear
+weight_decay: 0.01
+num_train_epochs: 1
+logging_strategy: steps
+logging_steps: 1
+save_strategy: steps
+save_steps: 200
+overwrite_output_dir: true
+remove_unused_columns: false
+report_to: none
+seed: 42
+
+# Full FT removes architecture-specific LoRA placement as an experimental
+# variable. GRPO configs used with this recipe must keep kl_coef=0 because the
+# current reference-policy implementation relies on disabling a LoRA adapter.
+lora_enabled: false

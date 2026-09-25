@@ -1,0 +1,3 @@
+# MRR over the sample's own slate.
+reward_type: mrr
+reward_ndcg_k: 8

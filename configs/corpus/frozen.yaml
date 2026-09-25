@@ -1,0 +1,2 @@
+# Immutable document embeddings used by query-only training.
+index_dir: artifacts/frozen-corpus

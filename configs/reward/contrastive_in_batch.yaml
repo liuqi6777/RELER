@@ -1,0 +1,3 @@
+reward_type: contrastive
+contrastive_use_in_batch_negatives: true
+contrastive_temperature: 0.03

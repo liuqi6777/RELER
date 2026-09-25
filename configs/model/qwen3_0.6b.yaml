@@ -1,0 +1,7 @@
+model_name_or_path: Qwen/Qwen3-0.6B
+pooling_method: last
+padding_side: left
+append_token: pad
+query_prompt_template: "Instruct: {task_description}\nQuery:{query}"
+document_prompt_template: "{document}"
+embedding_max_length: 8192

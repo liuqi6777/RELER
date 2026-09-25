@@ -1,0 +1,6 @@
+# Primary exact reward. Other samples' positives extend the ranked pool and are
+# scored as detached mean embeddings; frozen-document rescaling calibrates them
+# against the sampled own-query slate.
+reward_type: ndcg_in_batch
+reward_ndcg_k: 10
+ndcg_in_batch_include_negatives: false

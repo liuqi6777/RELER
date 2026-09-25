@@ -1,0 +1,8 @@
+model_name_or_path: AQ-MedAI/Diver-Retriever-0.6B
+pooling_method: last
+padding_side: left
+# Verified tokenizer.json appends endoftext (151643), matching tokens-v2 pad.
+append_token: pad
+query_prompt_template: "Instruct: {task_description}\nQuery:{query}"
+document_prompt_template: "{document}"
+embedding_max_length: 8192

@@ -1,0 +1,17 @@
+# Generic query/document product policy.
+action_components:
+  - [query]
+  - [positive, negative]
+group_size: 32
+kappa: 755
+sigma_learnable: false
+advantage_norm: none
+sampling_law: vmf
+rollout: product
+gradient_estimator: score_function # Opt in to conditional_projection after paired diagnostics.
+frozen_doc_rescale: true
+advantage_baseline: leave_one_out
+document_log_prob_reduction: sum
+target_alignment: null
+final_alignment: null
+exploration_schedule: fixed

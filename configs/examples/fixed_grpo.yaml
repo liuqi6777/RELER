@@ -1,0 +1,12 @@
+# Query-only RELER GRPO with immutable document embeddings.
+_base_:
+  - ../train/full_finetune.yaml
+  - ../dataset/e2rank_listwise.yaml
+  - ../model/qwen3_embedding_0.6b.yaml
+  - ../grpo/query_only.yaml
+  - ../reward/ndcg_listwise_in_batch.yaml
+  - ../corpus/frozen.yaml
+
+output_dir: checkpoints/reler-fixed-grpo
+run_name: reler-fixed-grpo
+overwrite_output_dir: false

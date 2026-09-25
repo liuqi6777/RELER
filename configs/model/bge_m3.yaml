@@ -1,0 +1,8 @@
+# BGE-M3 dense embedding protocol (CLS pooling, no role prefix).
+model_name_or_path: BAAI/bge-m3
+pooling_method: cls
+padding_side: right
+append_token: none
+query_prompt_template: "{query}"
+document_prompt_template: "{document}"
+embedding_max_length: 8192
