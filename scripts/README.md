@@ -75,3 +75,8 @@ The runner writes results to `results/mteb/`. To summarize an existing result tr
 ```bash
 reler-summarize results/mteb 'MTEB(eng, v2)'
 ```
+
+For BRIGHT, the `reler-eval --tasks BrightRetrieval` entrypoint accepts
+`--bright_query_set original` (default) or `--bright_query_set gpt4-reasoning`.
+The latter uses official generated queries and isolates its results under
+`<output_dir>/query-gpt4-reasoning/`. See the root README for a complete command.

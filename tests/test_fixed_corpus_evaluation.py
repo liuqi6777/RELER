@@ -244,3 +244,15 @@ def test_bright_runner_opens_and_completes_one_fixed_cache_per_subset(
 
     assert len(results) == 1
     assert (tmp_path / "cache" / "biology" / "cache.json").is_file()
+
+    # Switching query sets must not invalidate the unchanged E0 document cache.
+    run_bright(
+        task,
+        model,
+        EvalArguments(
+            output_dir=str(tmp_path / "results"), bright_query_set="gpt4-reasoning"
+        ),
+        eval_subsets=["biology"],
+    )
+    assert len(corpus_model.calls) == 1
+    assert len(query_model.calls) == 2

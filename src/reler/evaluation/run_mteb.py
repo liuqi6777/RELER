@@ -3,10 +3,12 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import mteb
 import torch
+from datasets import load_dataset
 from transformers import HfArgumentParser
 
 from reler.config.loader import load_raw_config_file
@@ -29,6 +31,8 @@ BRIGHT_SPLIT = "standard"
 BRIGHT_DATASET_PATH = "xlangai/BRIGHT"
 BRIGHT_DATASET_CONFIG = "documents"
 BRIGHT_DATASET_REVISION = "3066d29c9651a576c8aba4832d249807b181ecae"
+BRIGHT_QUERY_SETS = ("original", "gpt4-reasoning")
+BRIGHT_GPT4_QUERY_CONFIG = "gpt4_reason"
 BRIGHT_INSTRUCTIONS = {
     "biology": "Given a biology post, retrieve relevant passages that help answer the post.",
     "earth_science": "Given an earth science post, retrieve relevant passages that help answer the post.",
@@ -125,7 +129,7 @@ class EvalArguments:
     bright_dataset_revision: str = field(
         default=BRIGHT_DATASET_REVISION,
         metadata={
-            "help": "Immutable xlangai/BRIGHT revision used for documents/examples"
+            "help": "Immutable xlangai/BRIGHT revision used for documents and both query sets"
         },
     )
     bright_cache_dir: Optional[str] = field(
@@ -134,8 +138,20 @@ class EvalArguments:
             "help": "Optional Hugging Face cache directory for official BRIGHT data"
         },
     )
+    bright_query_set: str = field(
+        default="original",
+        metadata={
+            "choices": BRIGHT_QUERY_SETS,
+            "help": "BRIGHT queries: original or official gpt4_reason.query retrieval inputs",
+        },
+    )
 
     def __post_init__(self):
+        if self.bright_query_set not in BRIGHT_QUERY_SETS:
+            raise ValueError(
+                f"Unknown BRIGHT query set: {self.bright_query_set!r}; "
+                f"expected one of {BRIGHT_QUERY_SETS}"
+            )
         if isinstance(self.tasks, str):
             self.tasks = self.tasks.split(",")
         if isinstance(self.langs, str):
@@ -213,12 +229,37 @@ def _bright_result_subsets(result) -> set[str]:
     }
 
 
+def _load_bright_reasoning_queries(subset: str, args: EvalArguments) -> dict[str, str]:
+    """Read the complete generated retrieval inputs without gold annotations."""
+    records = load_dataset(
+        BRIGHT_DATASET_PATH,
+        BRIGHT_GPT4_QUERY_CONFIG,
+        split=subset,
+        cache_dir=args.bright_cache_dir,
+        revision=args.bright_dataset_revision,
+    )
+    queries = {}
+    for record in records:
+        query_id, text = record.get("id"), record.get("query")
+        if not isinstance(query_id, str) or not query_id.strip():
+            raise ValueError(f"Invalid BRIGHT GPT-4 query ID in {subset!r}")
+        if query_id in queries:
+            raise ValueError(f"Duplicate BRIGHT GPT-4 query ID: {subset}/{query_id}")
+        if not isinstance(text, str) or text.strip().lower() in {"", "empty", "n/a"}:
+            raise ValueError(
+                f"Missing official BRIGHT GPT-4 query: {subset}/{query_id}"
+            )
+        queries[query_id] = text
+    return queries
+
+
 def load_official_bright(task, subsets: list[str], args: EvalArguments) -> None:
     """Bypass MTEB's older pin and explicitly load BRIGHT's official documents config."""
     identity = {
         "path": BRIGHT_DATASET_PATH,
         "config": BRIGHT_DATASET_CONFIG,
         "revision": args.bright_dataset_revision,
+        "query_set": args.bright_query_set,
         "subsets": sorted(subsets),
     }
     if getattr(task, "_reler_bright_identity", None) == identity:
@@ -230,6 +271,20 @@ def load_official_bright(task, subsets: list[str], args: EvalArguments) -> None:
         cache_dir=args.bright_cache_dir,
         revision=args.bright_dataset_revision,
     )
+    if args.bright_query_set == "gpt4-reasoning":
+        for subset in subsets:
+            generated = _load_bright_reasoning_queries(subset, args)
+            original = queries[subset][BRIGHT_SPLIT]
+            if generated.keys() != original.keys():
+                raise ValueError(
+                    f"BRIGHT GPT-4 query IDs differ for {subset!r}: "
+                    f"missing={sorted(original.keys() - generated.keys())[:5]}, "
+                    f"unexpected={sorted(generated.keys() - original.keys())[:5]}"
+                )
+            # Match by ID, keeping the original query order, corpus and qrels.
+            queries[subset][BRIGHT_SPLIT] = {
+                query_id: generated[query_id] for query_id in original
+            }
     task.corpus = corpus
     task.queries = queries
     task.relevant_docs = relevant_docs
@@ -285,6 +340,15 @@ def run_bright(task, model, args, **kwargs):
             f"got {list(requested_splits)!r}"
         )
 
+    output_folder = args.output_dir
+    if args.bright_query_set != "original":
+        output_folder = str(Path(output_folder) / f"query-{args.bright_query_set}")
+    logger.info(
+        "Using BRIGHT query set %s; results directory: %s",
+        args.bright_query_set,
+        output_folder,
+    )
+
     final_result = None
     for subset in requested_subsets:
         logger.info("Evaluating BRIGHT subset %s", subset)
@@ -295,7 +359,7 @@ def run_bright(task, model, args, **kwargs):
         try:
             results = evaluation.run(
                 _InstructionOverrideModel(model, BRIGHT_INSTRUCTIONS[subset]),
-                output_folder=args.output_dir,
+                output_folder=output_folder,
                 encode_kwargs=args.encode_kwargs or {},
                 eval_splits=[BRIGHT_SPLIT],
                 eval_subsets=[subset],
@@ -435,6 +499,8 @@ def main():
                 else:
                     t.load_data()
             except Exception as e:
+                if t.metadata.name == BRIGHT_TASK_NAME:
+                    raise
                 logger.warning(
                     f"meet error when loading task: {t.metadata.name}. {str(e)}"
                 )

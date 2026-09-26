@@ -178,6 +178,30 @@ bash scripts/run_mteb.sh \
 
 Results are written under `results/mteb/`. A checkpoint containing `embedding_protocol.json` supplies its own pooling and text-formatting settings; the model config remains useful for a base model without that sidecar.
 
+For BRIGHT, select the official GPT-4 reasoning queries with one argument:
+
+```bash
+reler-eval \
+  --model checkpoints/reler \
+  --tasks BrightRetrieval \
+  --langs eng \
+  --bright_query_set gpt4-reasoning \
+  --model_kwargs '{"max_length": 8192}' \
+  --batch_size 16 \
+  --output_dir results/bright
+```
+
+`--bright_query_set original` is the default. The GPT-4 mode reads the complete
+`query` field from the official `gpt4_reason` configuration at the same pinned
+dataset revision as the corpus. It matches query IDs exactly, keeps the original
+corpus and relevance labels, and never appends human reasoning annotations.
+Missing, duplicate, or mismatched queries fail the run.
+
+Original results retain the usual output path. GPT-4 results and predictions go
+under `<output_dir>/query-gpt4-reasoning/`, so both modes can use the same output
+root without reusing each other's results. The switch also works with fixed-corpus
+evaluation; document embeddings remain reusable because the corpus is unchanged.
+
 For BRIGHT, a query-only checkpoint can be evaluated against documents encoded by its immutable E0 model. The first run builds a sequential cache per subset; later runs validate its protocol and reuse it:
 
 ```bash
