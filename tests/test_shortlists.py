@@ -28,6 +28,7 @@ def limit_threads():
 @pytest.mark.parametrize('pool_size,size,hard,band,count', [
     (100, 15, 8, 64, 4), (100, 15, 8, 16, 9), (70, 15, 8, 64, 6),
     (9, 15, 8, 64, 4), (1, 15, 8, 64, 3), (0, 15, 8, 64, 4),
+    (100, 0, 0, 64, 1), (0, 0, 0, 64, 4),
     (100, 15, 0, 64, 8), (100, 15, 15, 15, 4),
 ])
 def test_coverage_is_maximal_and_no_list_contains_duplicates(pool_size, size, hard, band, count):
@@ -36,8 +37,11 @@ def test_coverage_is_maximal_and_no_list_contains_duplicates(pool_size, size, ha
     valid[0, :pool_size] = True
     valid[1, :pool_size:2] = True
     torch.manual_seed(12)
+    rng_before = torch.get_rng_state().clone()
     indices, mask, high = sample_shortlists(scores, valid, count=count, size=size,
                                            hard_count=hard, hard_pool_size=band)
+    if size == 0:
+        torch.testing.assert_close(torch.get_rng_state(), rng_before, rtol=0, atol=0)
     for b in range(2):
         n = int(valid[b].sum())
         selected = indices[b][mask[b]]
@@ -46,7 +50,7 @@ def test_coverage_is_maximal_and_no_list_contains_duplicates(pool_size, size, ha
         for t in range(count):
             row = indices[b, t, mask[b, t]]
             assert row.numel() == min(n, size) == row.unique().numel()
-        if n:
+        if n and size:
             # Across repeated traversals, no candidate can be overexposed by >1.
             frequencies = torch.bincount(selected, minlength=scores.size(1))[valid[b]]
             assert int(frequencies.max() - frequencies.min()) <= 1
@@ -144,7 +148,8 @@ def components(means, q, docs, valid):
 
 @pytest.mark.parametrize('estimator', ['score_function', 'conditional_projection'])
 @pytest.mark.parametrize('rescale', [True, False])
-def test_shared_encoder_gradient_matches_per_cell_oracle(monkeypatch, estimator, rescale):
+@pytest.mark.parametrize('size', [0, 2])
+def test_shared_encoder_gradient_matches_per_cell_oracle(monkeypatch, estimator, rescale, size):
     torch.manual_seed(8)
     source = torch.randn(3, 4, 17)
     weight = torch.eye(17, requires_grad=True)
@@ -159,11 +164,16 @@ def test_shared_encoder_gradient_matches_per_cell_oracle(monkeypatch, estimator,
         captured.append(result)
         return result
     monkeypatch.setattr(shortlist_module, 'sample_shortlists', sample)
-    head = GRPO(**options(gradient_estimator=estimator, frozen_doc_rescale=rescale))
+    if not size:
+        def unexpected_pool(*args, **kwargs):
+            raise AssertionError('Own-only rewards must not gather cross-query documents')
+        monkeypatch.setattr(shortlist_module, 'cross_query_document_pool', unexpected_pool)
+    head = GRPO(**options(gradient_estimator=estimator, frozen_doc_rescale=rescale,
+                         reward_shortlist_size=size, reward_shortlist_hard_count=min(size, 1)))
     with torch.autocast('cpu', dtype=torch.bfloat16):
         loss, stats, _, _ = head._compute_component_loss(
             labels, None, components(means, q, docs, valid), candidate_mask=valid,
-            cross_batch_metadata=metadata())
+            cross_batch_metadata=metadata() if size else None)
     actual = torch.autograd.grad(loss, weight)[0]
     reference_weight = torch.eye(17, requires_grad=True)
     ref = F.normalize(source @ reference_weight.T, dim=-1)
@@ -175,12 +185,12 @@ def test_shared_encoder_gradient_matches_per_cell_oracle(monkeypatch, estimator,
     assert actual.norm() > 0
     torch.testing.assert_close(stats['reward_mean'], reward.mean())
     torch.testing.assert_close(stats['reward_std'], reward.std(unbiased=False), atol=1e-6, rtol=1e-5)
-    assert stats['shortlist/unique_candidates_mean'] == 3  # 4, 5, 0 after identity filtering.
+    assert stats['shortlist/unique_candidates_mean'] == (3 if size else 0)
     if estimator == 'conditional_projection':
         assert stats['projection/query_span_rank_max'] <= 6  # 1 query + 3 own + 2 selected.
 
 
-def _distributed_worker(rank, rendezvous, estimator, pool_source, binary_weight=0., pairwise_coef=0.):
+def _distributed_worker(rank, rendezvous, estimator, pool_source, binary_weight=0., pairwise_coef=0., size=2):
     import torch.distributed as dist
     torch.set_num_threads(1)
     dist.init_process_group('gloo', init_method=f'file://{rendezvous}', rank=rank, world_size=2,
@@ -206,11 +216,12 @@ def _distributed_worker(rank, rendezvous, estimator, pool_source, binary_weight=
         shortlist_module.sample_shortlists = sample
         head = GRPO(**options(gradient_estimator=estimator, reward_shortlist_pool_source=pool_source,
                               reward_cross_device_negatives=pool_source != 'local_all',
+                              reward_shortlist_size=size, reward_shortlist_hard_count=min(size, 1),
                               reward_shortlist_binary_weight=binary_weight,
                               reward_shortlist_pairwise_coef=pairwise_coef))
         loss, _, _, _ = head._compute_component_loss(labels[start:stop, :width], None,
             components(local, q[start:stop], docs[start:stop, :, :width], valid[start:stop, :width]),
-            candidate_mask=valid[start:stop, :width], cross_batch_metadata=rows,
+            candidate_mask=valid[start:stop, :width], cross_batch_metadata=rows if size else None,
             positive_mask=positives[start:stop, :width])
         loss.backward()
         actual = weight.grad.clone()
@@ -232,8 +243,8 @@ def _distributed_worker(rank, rendezvous, estimator, pool_source, binary_weight=
         }[pool_source][start:stop]
         for b, n in enumerate(expected_counts):
             selected = indices[b][masks[b]]
-            assert selected.unique().numel() == n
-            assert (masks[b].sum(-1) == min(n, 2)).all()
+            assert selected.unique().numel() == (n if size else 0)
+            assert (masks[b].sum(-1) == min(n, size)).all()
         dist.all_gather_object(selections, (indices, masks))
         idx = torch.cat([row[0] for row in selections])
         mask = torch.cat([row[1] for row in selections])
@@ -249,7 +260,7 @@ def _distributed_worker(rank, rendezvous, estimator, pool_source, binary_weight=
             from test_pairwise_projection import explicit_pair_loss
             pool = ref[:,1:].detach().reshape(-1,12)
             pair_loss = sum(explicit_pair_loss(ref,q,docs,positives,valid,pool[idx[:,t]],mask[:,t],
-                                               9.,mean_alignment(12,9.)) for t in range(idx.size(1))) / idx.size(1)
+                                               9.,mean_alignment(12,9.),estimator) for t in range(idx.size(1))) / idx.size(1)
             expected = expected + pairwise_coef * pair_loss
         expected.backward()
         torch.testing.assert_close(actual, reference_weight.grad, atol=4e-6, rtol=4e-5)
@@ -264,7 +275,8 @@ def test_two_ranks_with_uneven_tails_and_no_cross_candidates_on_one_rank(tmp_pat
                                nprocs=2, join=True)
 
 
-@pytest.mark.parametrize('changes', [dict(reward_shortlist_count=-1), dict(reward_shortlist_size=0),
+@pytest.mark.parametrize('changes', [dict(reward_shortlist_count=-1), dict(reward_shortlist_size=-1),
+    dict(reward_shortlist_size=0),  # Still invalid with a nonzero hard quota.
     dict(reward_shortlist_hard_count=3), dict(reward_shortlist_hard_pool_size=0),
     dict(reward_cross_device_negatives=False), dict(cross_query_document_gradients=True),
     dict(reward_shortlist_pool_source='unknown'),
@@ -282,12 +294,14 @@ def test_invalid_policy_and_sampler_rejected_by_both_entrypoints(changes):
 
 @pytest.mark.parametrize('source', ['cross_device_all', 'local_all', 'cross_device_representatives'])
 @pytest.mark.parametrize('binary_weight,pairwise_coef', [(0.,0.), (.25,0.), (0.,.25)])
-def test_trainer_updates_saves_and_reuses_encoder_and_actions(tmp_path, monkeypatch, source, binary_weight, pairwise_coef):
+@pytest.mark.parametrize('estimator,size', [('conditional_projection', 2), ('conditional_projection', 0), ('score_function', 0)])
+def test_trainer_updates_saves_and_reuses_encoder_and_actions(tmp_path, monkeypatch, source, binary_weight, pairwise_coef, estimator, size):
     from transformers import BertConfig, BertModel, TrainingArguments
     torch.manual_seed(7)
     backbone = BertModel(BertConfig(vocab_size=16, hidden_size=8, num_hidden_layers=1,
         num_attention_heads=2, intermediate_size=16, hidden_dropout_prob=0, attention_probs_dropout_prob=0))
-    wrapper = GRPOModel(backbone, RLArguments(**options(reward_shortlist_pool_source=source,
+    wrapper = GRPOModel(backbone, RLArguments(**options(gradient_estimator=estimator,
+        reward_shortlist_size=size, reward_shortlist_hard_count=min(size, 1), reward_shortlist_pool_source=source,
         reward_cross_device_negatives=source != 'local_all', reward_shortlist_binary_weight=binary_weight,
         reward_shortlist_pairwise_coef=pairwise_coef)))
     calls = dict(encoder=0, actions=0, pool=0)
@@ -312,12 +326,17 @@ def test_trainer_updates_saves_and_reuses_encoder_and_actions(tmp_path, monkeypa
         save_steps=1, report_to=[], disable_tqdm=True, remove_unused_columns=False),
         train_dataset=[0, 1], data_collator=lambda _: batch)
     trainer.train()
-    assert calls == dict(encoder=2, actions=2, pool=1)
+    assert calls == dict(encoder=2, actions=2, pool=1 if size else 0)
     assert (backbone.embeddings.word_embeddings.weight.detach() - before).norm() > 0
     checkpoint = tmp_path / 'checkpoint-1'
     payload = json.loads((checkpoint / 'exploration_state.json').read_text())
     assert payload['reward_shortlists'] == shortlist_contract(wrapper.grpo)
     restore_exploration_state(wrapper, checkpoint)
+    wrapper.grpo.gradient_estimator = ('score_function' if estimator == 'conditional_projection'
+                                       else 'conditional_projection')
+    with pytest.raises(ValueError):
+        restore_exploration_state(wrapper, checkpoint)
+    wrapper.grpo.gradient_estimator = estimator
     wrapper.grpo.reward_shortlist_binary_weight = .5
     with pytest.raises(ValueError):
         restore_exploration_state(wrapper, checkpoint)

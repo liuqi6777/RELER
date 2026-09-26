@@ -99,6 +99,12 @@ define the retrieval signal and its candidate-pool behavior.
 
 `NPROC_PER_NODE` controls the local process count and defaults to `8`. `NNODES` defaults to `1`. Both launchers forward other arguments to their training entrypoint.
 
+For the RELER own-candidate objective (graded nDCG@10 plus pairwise feedback),
+use `configs/examples/reler.yaml`. It enables CMP with 64 actions per side and
+alignment 0.70; `--gradient_estimator score_function` switches both reward
+components to unprojected RLOO. See [training configuration](docs/grpo.md#training-configuration)
+for the command and overrides.
+
 ## Fixed-corpus GRPO
 
 Fixed-corpus training encodes documents once, then trains only the query encoder. Build a lookup directory with the same model and document protocol used to initialize training:

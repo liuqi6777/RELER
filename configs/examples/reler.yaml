@@ -1,0 +1,26 @@
+# Joint embedding training with own-query candidates and graded nDCG + pairwise.
+_base_:
+  - ../train/full_finetune.yaml
+  - ../dataset/e2rank_listwise.yaml
+  - ../model/qwen3_embedding_0.6b.yaml
+  - ../grpo/default.yaml
+  - ../reward/ndcg_in_batch_all.yaml
+
+output_dir: checkpoints/reler
+run_name: reler
+overwrite_output_dir: false
+max_steps: 113
+save_steps: 113
+max_grad_norm: 0.0
+data_seed: 42
+rollout_seed: 42
+
+gradient_estimator: conditional_projection
+group_size: 64
+target_alignment: 0.70
+reward_ndcg_k: 10
+reward_shortlist_count: 1
+reward_shortlist_size: 0
+reward_shortlist_hard_count: 0
+reward_shortlist_pool_source: local_all
+reward_shortlist_pairwise_coef: 0.5

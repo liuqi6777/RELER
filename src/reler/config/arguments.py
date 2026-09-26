@@ -790,7 +790,7 @@ class RLArguments:
     reward_shortlist_size: int = field(
         default=15,
         metadata={
-            "help": "Cross-query negatives per shortlist; own candidates are always retained"
+            "help": "Cross-query negatives per shortlist; 0 keeps only own candidates (count > 0)"
         },
     )
     reward_shortlist_hard_count: int = field(
@@ -814,7 +814,7 @@ class RLArguments:
     reward_shortlist_pairwise_coef: float = field(
         default=0.0,
         metadata={
-            "help": "Add original-positive pair rewards with separate per-pair LOO/CP on each shortlist"
+            "help": "Add original-positive pair rewards with per-pair RLOO, using the selected gradient_estimator"
         },
     )
     cross_query_document_gradients: bool = field(

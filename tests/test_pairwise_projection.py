@@ -18,12 +18,15 @@ from reler.objectives.shortlists import sample_shortlists
 from reler.training.grpo_model import GRPO
 
 
-def explicit_pair_loss(means, q, docs, positives, valid, fixed, fixed_mask, kappa, scale):
+def explicit_pair_loss(means, q, docs, positives, valid, fixed, fixed_mask, kappa, scale,
+                       estimator='conditional_projection'):
     """Slow full SVD per cell/endpoint, independent of the vectorized implementation."""
     batch, gq, dim = q.shape
     gd, count = docs.shape[1:3]
     coefficient = torch.zeros_like(means, dtype=torch.float64)
     def project(action, *columns):
+        if estimator == 'score_function':
+            return action.double()
         matrix = torch.stack(columns, -1).double()
         u, s, _ = torch.linalg.svd(matrix, full_matrices=False)
         u = u[:, s > 1e-10]
@@ -56,7 +59,8 @@ def explicit_pair_loss(means, q, docs, positives, valid, fixed, fixed_mask, kapp
 @pytest.mark.parametrize('scale', [1., .35])
 @pytest.mark.parametrize('chunk', [1, 7, 32])
 @pytest.mark.parametrize('cached', [False, True])
-def test_pair_cp_matches_full_cellwise_svd_and_only_credits_endpoints(scale, chunk, cached):
+@pytest.mark.parametrize('estimator', ['conditional_projection', 'score_function'])
+def test_pair_gradient_matches_cellwise_oracle_and_only_credits_endpoints(scale, chunk, cached, estimator):
     torch.manual_seed(38)
     source = torch.randn(2, 5, 11)
     weight = torch.eye(11, requires_grad=True)
@@ -71,33 +75,42 @@ def test_pair_cp_matches_full_cellwise_svd_and_only_credits_endpoints(scale, chu
                    cross_scores=torch.einsum('bid,bkd->bik', q, fixed) * scale) if cached else {})
     with torch.autocast('cpu', dtype=torch.bfloat16):
         loss, stats = pairwise_shortlist_loss(means[:,0], means[:,1:], q, docs, positives,
-            valid, fixed, mask, 9., frozen_scale=scale, chunk_size=chunk, **kwargs)
+            valid, fixed, mask, 9., frozen_scale=scale, chunk_size=chunk,
+            gradient_estimator=estimator, **kwargs)
     actual, fixed_grad, q_grad, doc_grad = torch.autograd.grad(loss, (weight, fixed, q, docs), allow_unused=True)
     assert fixed_grad is None and q_grad is None and doc_grad is None
     ref_weight = torch.eye(11, requires_grad=True)
     ref = F.normalize(source @ ref_weight.T, dim=-1)
-    expected = explicit_pair_loss(ref, q, docs, positives, valid, fixed, mask, 9., scale)
+    expected = explicit_pair_loss(ref, q, docs, positives, valid, fixed, mask, 9., scale, estimator)
     torch.testing.assert_close(actual, torch.autograd.grad(expected, ref_weight)[0], atol=2e-6, rtol=3e-5)
     assert actual.norm() > 0
     assert stats['reward/pairwise/pairs_mean'] == 3  # Six pairs then zero, averaged over queries.
     assert stats['reward/pairwise/no_pairs_frac'] == .5
-    assert stats['projection/pairwise_query_span_rank_max'] == 2
+    if estimator == 'conditional_projection':
+        assert stats['projection/pairwise_query_span_rank_max'] == 2
+    _, cp_stats = pairwise_shortlist_loss(means[:,0], means[:,1:], q, docs, positives,
+        valid, fixed, mask, 9., frozen_scale=scale, chunk_size=chunk, **kwargs)
+    for key in ('reward/pairwise/mean', 'reward/pairwise/pairs_mean',
+                'reward/pairwise/no_pairs_frac', 'reward/pairwise/active_pair_fraction'):
+        torch.testing.assert_close(stats[key], cp_stats[key], rtol=0, atol=0)
     # Per-input gradients for the zero-pair query and padded documents are zero.
     live = means.detach().requires_grad_()
-    direct, _ = pairwise_shortlist_loss(live[:,0], live[:,1:], q, docs, positives, valid, fixed, mask, 9.)
+    direct, _ = pairwise_shortlist_loss(live[:,0], live[:,1:], q, docs, positives, valid, fixed, mask, 9.,
+        gradient_estimator=estimator)
     grad = torch.autograd.grad(direct, live)[0]
     assert grad[1].norm() == 0 and grad[0,-1].norm() == 0
 
 
 @pytest.mark.parametrize('no_pairs', [False, True])
-def test_ties_zero_pairs_and_collinear_directions_are_finite(no_pairs):
+@pytest.mark.parametrize('estimator', ['conditional_projection', 'score_function'])
+def test_ties_zero_pairs_and_collinear_directions_are_finite(no_pairs, estimator):
     x = torch.tensor([[[1.,0.,0.], [1.,0.,0.], [1.,0.,0.]]], requires_grad=True)
     h = F.normalize(x, dim=-1)
     q = h[:,0,None].expand(1,3,3).detach()
     docs = h[:,None,1:].expand(1,4,2,3).detach()
     loss, stats = pairwise_shortlist_loss(h[:,0],h[:,1:],q,docs,
         torch.tensor([[True,no_pairs]]),torch.ones(1,2,dtype=torch.bool),
-        torch.empty(1,0,3),torch.empty(1,0,dtype=torch.bool),9.)
+        torch.empty(1,0,3),torch.empty(1,0,dtype=torch.bool),9.,gradient_estimator=estimator)
     assert torch.isfinite(loss) and loss == 0
     assert torch.autograd.grad(loss,x)[0].norm() == 0
     assert stats['reward/pairwise/mean'] == (0. if no_pairs else .5)
@@ -105,7 +118,9 @@ def test_ties_zero_pairs_and_collinear_directions_are_finite(no_pairs):
 
 
 @pytest.mark.parametrize('coefficient,binary_weight', [(.25,0.), (.5,0.), (.25,.25), (.5,.25)])
-def test_full_shortlist_objective_matches_separate_list_and_pair_oracles(monkeypatch, coefficient, binary_weight):
+@pytest.mark.parametrize('size,count', [(2, 2), (0, 1)])
+@pytest.mark.parametrize('estimator', ['conditional_projection', 'score_function'])
+def test_full_shortlist_objective_matches_separate_list_and_pair_oracles(monkeypatch, coefficient, binary_weight, size, count, estimator):
     torch.manual_seed(43)
     source = torch.randn(3, 4, 13)
     weight = torch.eye(13, requires_grad=True)
@@ -121,8 +136,9 @@ def test_full_shortlist_objective_matches_separate_list_and_pair_oracles(monkeyp
         captured.append(result)
         return result
     monkeypatch.setattr(shortlist_module,'sample_shortlists',sample)
-    head = GRPO(**options(reward_shortlist_pairwise_coef=coefficient,
-                          reward_shortlist_binary_weight=binary_weight, reward_shortlist_count=2))
+    head = GRPO(**options(gradient_estimator=estimator, reward_shortlist_pairwise_coef=coefficient,
+                          reward_shortlist_binary_weight=binary_weight, reward_shortlist_count=count,
+                          reward_shortlist_size=size, reward_shortlist_hard_count=min(size, 1)))
     loss, stats, _, _ = head._compute_component_loss(labels,None,components(means,q,docs,valid),
         candidate_mask=valid,cross_batch_metadata=metadata(),positive_mask=positives)
     actual = torch.autograd.grad(loss,weight)[0]
@@ -131,11 +147,11 @@ def test_full_shortlist_objective_matches_separate_list_and_pair_oracles(monkeyp
     idx,mask,_ = captured[0]
     pool = ref[:,1:].detach().reshape(-1,13)
     scale = mean_alignment(13,9.)
-    main,_ = reference_loss(ref,q,docs,labels,valid,pool,idx,mask,'conditional_projection',scale)
+    main,_ = reference_loss(ref,q,docs,labels,valid,pool,idx,mask,estimator,scale)
     if binary_weight:
-        binary,_ = reference_loss(ref,q,docs,positives.float(),valid,pool,idx,mask,'conditional_projection',scale)
+        binary,_ = reference_loss(ref,q,docs,positives.float(),valid,pool,idx,mask,estimator,scale)
         main = (1-binary_weight)*main + binary_weight*binary
-    pairs = sum(explicit_pair_loss(ref,q,docs,positives,valid,pool[idx[:,t]],mask[:,t],9.,scale)
+    pairs = sum(explicit_pair_loss(ref,q,docs,positives,valid,pool[idx[:,t]],mask[:,t],9.,scale,estimator)
                 for t in range(idx.size(1))) / idx.size(1)
     expected = main + coefficient * pairs
     torch.testing.assert_close(actual,torch.autograd.grad(expected,ref_weight)[0],atol=3e-6,rtol=4e-5)
@@ -146,14 +162,16 @@ def test_full_shortlist_objective_matches_separate_list_and_pair_oracles(monkeyp
 @pytest.mark.parametrize('changes', [dict(reward_shortlist_pairwise_coef=-1),
     dict(reward_shortlist_pairwise_coef=float('nan')), dict(reward_shortlist_pairwise_coef=float('inf')),
     dict(reward_shortlist_pairwise_coef=.25,reward_shortlist_count=0),
-    dict(reward_shortlist_pairwise_coef=.25,gradient_estimator='score_function')])
+    dict(reward_shortlist_pairwise_coef=.25,gradient_estimator='invalid')])
 def test_invalid_pair_configuration_rejected(changes):
     for constructor in (RLArguments,GRPO):
         with pytest.raises(ValueError):
             constructor(**options(**changes))
 
 
-def test_two_rank_pair_gradient_with_uneven_tails_and_empty_cross_pool(tmp_path):
+@pytest.mark.parametrize('estimator', ['conditional_projection', 'score_function'])
+@pytest.mark.parametrize('size', [0, 2])
+def test_two_rank_pair_gradient_with_uneven_tails_and_empty_cross_pool(tmp_path, estimator, size):
     torch.multiprocessing.spawn(_distributed_worker,
-        args=(str(tmp_path / 'rendezvous'), 'conditional_projection', 'cross_device_all', 0., .25),
+        args=(str(tmp_path / 'rendezvous'), estimator, 'cross_device_all', 0., .25, size),
         nprocs=2, join=True)

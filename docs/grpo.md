@@ -39,6 +39,22 @@ pairwise ranking signals. Candidate masks and known-positive filters are applied
 consistently to local, in-batch, and cross-device pools. Optional shortlists reduce
 large pools while preserving the configured estimator contract.
 
+Set `reward_shortlist_count: 1`, `reward_shortlist_size: 0`, and
+`reward_shortlist_hard_count: 0` to retain only each query's own candidates.
+The shortlist objective stays active, including pairwise feedback. It skips
+cross-query document gathering and shortlist sampling, while preserving the
+global query mean for uneven distributed batches. `reward_shortlist_count: 0`
+instead disables this objective and uses the ordinary reward path.
+
+`reward_shortlist_pairwise_coef` adds binary positive-versus-negative pair
+rewards using the annotated positive mask, independently of the teacher grades.
+The same `gradient_estimator` selects CMP or unprojected RLOO for both the
+listwise and pairwise terms. Pairwise document credit applies only to the pair's
+trainable endpoints; fixed negatives receive no gradient. Both estimators share
+pair selection, tie handling, per-pair leave-one-out weights, and per-query
+normalization. The unprojected path retains the same fixed-vMF product-policy
+constraints as CMP.
+
 The policy and reward implementations meet at `RewardEvaluator`: GRPO constructs
 only the score tables declared by the evaluator's candidate-pool requirements, then
 consumes generic weighted reward signals. Reward dispatch and raw weighting stay in
@@ -54,6 +70,31 @@ the trainer is independent of candidate-pool-specific bookkeeping.
 
 All reward ranking and similarity scoring is FP32. Padding candidates contribute
 neither reward nor gradient.
+
+## Training configuration
+
+`configs/examples/reler.yaml` composes the existing model, dataset, training,
+policy, and reward fragments for joint own-candidate training: graded nDCG@10
+plus pairwise weight 0.5, CMP, 64 actions per side, fixed alignment 0.70, and
+113 optimizer steps. The inherited batch size is 16 per GPU, giving a global
+batch of 128 with eight GPUs and no accumulation. Supply prepared training data
+with both teacher rankings and original positive identities through `--data_path`.
+
+```bash
+NPROC_PER_NODE=8 bash scripts/run_grpo.sh configs/examples/reler.yaml \
+  --data_path /path/to/train.jsonl
+
+# Same reward and sampled policy, with CMP disabled in both reward components.
+NPROC_PER_NODE=8 bash scripts/run_grpo.sh configs/examples/reler.yaml \
+  --data_path /path/to/train.jsonl \
+  --gradient_estimator score_function \
+  --output_dir checkpoints/reler-rloo
+```
+
+Set `--reward_shortlist_pairwise_coef 0` for the listwise-only objective, or
+override `--target_alignment` to change exploration. Set `--seed`, `--data_seed`,
+and `--rollout_seed` together when changing the training seed. Model selection,
+LoRA, step budget, and batch size remain ordinary configuration/CLI overrides.
 
 ## Reproducibility
 

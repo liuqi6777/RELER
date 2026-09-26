@@ -1,4 +1,4 @@
-"""Projection estimators for joint vMF product rollouts."""
+"""Conditional projection and pairwise RLOO for joint vMF product rollouts."""
 
 import torch
 import torch.nn.functional as F
@@ -237,18 +237,25 @@ def pairwise_shortlist_loss(
     frozen_mask,
     kappa,
     *,
+    gradient_estimator="conditional_projection",
     frozen_scale=1.0,
     own_scores=None,
     cross_scores=None,
     chunk_size=32,
 ):
-    """Return the item-local projection surrogate for binary shortlist pairs.
+    """Return the endpoint-local RLOO surrogate, optionally projected with CMP.
 
     Ties earn one half. Every valid annotated positive competes against every
     valid own negative and selected fixed negative. A query with no pair
     contributes zero. Pair membership never uses sampled scores, and only live
-    means receive gradients.
+    means receive gradients. Both estimators share rewards, per-axis LOO and
+    per-query pair normalization; only the action coefficients differ.
     """
+    if gradient_estimator not in {"conditional_projection", "score_function"}:
+        raise ValueError(
+            f"Unsupported pairwise gradient estimator: {gradient_estimator!r}"
+        )
+    project = gradient_estimator == "conditional_projection"
     batch, gq, dim = query_actions.shape
     gd, count = document_actions.shape[1:3]
     if (
@@ -268,7 +275,7 @@ def pairwise_shortlist_loss(
         or chunk_size < 1
     ):
         raise ValueError(
-            "Pairwise CP requires joint product actions, valid candidate masks "
+            "Pairwise RLOO requires joint product actions, valid candidate masks "
             "and a positive chunk size"
         )
     positives = shortlist_positive_mask(positive_mask, candidate_mask)
@@ -313,15 +320,17 @@ def pairwise_shortlist_loss(
                     continue
                 a = pos.repeat_interleave(neg.numel())
                 n = neg.repeat(pos.numel())
-                pool = torch.cat((docs[b], fixed[b][None].expand(gd, -1, -1)), dim=1)
+                if project:
+                    pool = torch.cat(
+                        (docs[b], fixed[b][None].expand(gd, -1, -1)), dim=1
+                    )
+                    radial_q = q[b] @ hq[b].float()
                 pool_scores = torch.cat(
                     (scores[b], cross[b, :, None].expand(-1, gd, -1)), dim=-1
                 )
-                radial_q = q[b] @ hq[b].float()
                 for start in range(0, pairs, chunk_size):
                     pa = a[start : start + chunk_size]
                     pn = n[start : start + chunk_size]
-                    delta = pool[:, pa] - pool[:, pn]
                     difference = pool_scores[..., pa] - pool_scores[..., pn]
                     reward = (difference > 0).float() + 0.5 * (difference == 0).float()
                     aq = (reward - reward.mean(0, keepdim=True)) * (gq / (gq - 1))
@@ -332,6 +341,17 @@ def pairwise_shortlist_loss(
                         flat.max(0).values != flat.min(0).values
                     ).float().sum() / pairs
 
+                    if not project:
+                        qc[b] += torch.einsum("ijp,id->d", aq, q[b]) / pairs
+                        # A pair credits only its trainable document endpoints.
+                        weights = docs.new_zeros(gd, count)
+                        weights.index_add_(1, pa, ad.sum(0))
+                        own = pn < count
+                        weights.index_add_(1, pn[own], ad[..., own].sum(0))
+                        dc[b] += torch.einsum("jm,jmd->md", weights, docs[b]) / pairs
+                        continue
+
+                    delta = pool[:, pa] - pool[:, pn]
                     unit, radial_delta, length = _tangents(delta, hq[b])
                     q_projection = (
                         difference - radial_q[:, None, None] * radial_delta[None]
@@ -367,8 +387,9 @@ def pairwise_shortlist_loss(
                 "reward/pairwise/pairs_mean": counts.mean(),
                 "reward/pairwise/active_pair_fraction": active.mean(),
                 "reward/pairwise/no_pairs_frac": (counts == 0).float().mean(),
-                "projection/pairwise_query_span_rank_max": rank_max,
             }
+            if project:
+                stats["projection/pairwise_query_span_rank_max"] = rank_max
         loss = (
             -scale
             * (

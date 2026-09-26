@@ -73,7 +73,7 @@ class _ShortlistEvaluation:
 def validate_shortlist_sampling(count, size, hard_count, hard_pool_size):
     for name, value, minimum in (
         ("count", count, 0),
-        ("size", size, 1),
+        ("size", size, 0),
         ("hard_count", hard_count, 0),
         ("hard_pool_size", hard_pool_size, 0),
     ):
@@ -107,9 +107,13 @@ def validate_shortlist_objectives(
         raise ValueError(
             "reward_shortlist_pairwise_coef must be finite and non-negative"
         )
-    if pairwise_coef and (not count or gradient_estimator != "conditional_projection"):
+    if pairwise_coef and (
+        not count
+        or gradient_estimator not in {"conditional_projection", "score_function"}
+    ):
         raise ValueError(
-            "Pairwise shortlist rewards require shortlists and conditional_projection"
+            "Pairwise rewards require shortlists and a conditional_projection or "
+            "score_function estimator"
         )
 
 
@@ -178,7 +182,11 @@ def shortlist_contract(head):
             version=1,
             pairs="all_own_positives_x_own_and_selected_negatives",
             reduction="per_query_mean",
-            estimator="per_pair_conditional_projection",
+            estimator=(
+                "per_pair_conditional_projection"
+                if head.gradient_estimator == "conditional_projection"
+                else "per_pair_rloo_score_function"
+            ),
             ties=0.5,
         )
     return contract
@@ -196,6 +204,7 @@ def sample_shortlists(scores, valid, *, count, size, hard_count, hard_pool_size)
     different hard fraction; coverage takes priority over a fixed hard quota.
     The first list and RNG consumption do not depend on T.
 
+    size=0 retains only own-query candidates and consumes no sampling RNG.
     On scarcity, transfer unavailable quota to the other stratum, then pad if
     the entire pool has fewer than K items. hard_count=0 is uniform over the
     entire allowed pool, not just the low-scoring remainder.
@@ -216,6 +225,8 @@ def sample_shortlists(scores, valid, *, count, size, hard_count, hard_pool_size)
     indices = torch.zeros((batch, count, size), dtype=torch.long, device=scores.device)
     mask = torch.zeros_like(indices, dtype=torch.bool)
     hard_mask = torch.zeros_like(mask)
+    if size == 0:
+        return indices, mask, hard_mask
     for b in range(batch):
         allowed = valid[b].nonzero(as_tuple=True)[0]
         if not allowed.numel():
@@ -297,15 +308,25 @@ def _prepare_shortlists(
     metadata,
     valid: torch.Tensor,
 ) -> _PreparedShortlists:
-    pool, allowed, loss_weight = cross_query_document_pool(
-        document.rollout_embeddings,
-        metadata,
-        include_negatives=settings.pool_source != "cross_device_representatives",
-        cross_device=settings.cross_device,
-        detach_documents=True,
-    )
-    if not settings.cross_device and torch.distributed.is_initialized():
-        # Match the cross-device path's global query mean on uneven DDP tails.
+    if settings.size == 0:
+        # Own candidates need neither identity metadata nor a cross-query gather.
+        pool = document.rollout_embeddings.new_empty(
+            (0, document.rollout_embeddings.size(-1))
+        )
+        allowed = valid.new_empty((labels.size(0), 0))
+        loss_weight = 1.0
+    else:
+        pool, allowed, loss_weight = cross_query_document_pool(
+            document.rollout_embeddings,
+            metadata,
+            include_negatives=settings.pool_source != "cross_device_representatives",
+            cross_device=settings.cross_device,
+            detach_documents=True,
+        )
+    if (
+        settings.size == 0 or not settings.cross_device
+    ) and torch.distributed.is_initialized():
+        # Preserve the global query mean even when document gathering is skipped.
         count = torch.tensor(labels.size(0), device=labels.device, dtype=torch.long)
         torch.distributed.all_reduce(count)
         loss_weight = torch.distributed.get_world_size() * labels.size(0) / count.item()
@@ -442,6 +463,7 @@ def _evaluate_one_shortlist(
             fixed,
             mask,
             query.kappa,
+            gradient_estimator=settings.gradient_estimator,
             frozen_scale=(
                 1.0 if frozen_document_scale is None else frozen_document_scale
             ),
