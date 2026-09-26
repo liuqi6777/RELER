@@ -271,7 +271,6 @@ def main(argv: list[str] | None = None) -> None:
             data_args,
             training_args,
             model_args,
-            preserve_document_metadata=True,
         )
         data_collator = FixedCorpusDataCollator(
             tokenizer=tokenizer,
@@ -289,7 +288,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         for warning in warn_on_inert_cutoffs(
             model.grpo.reward_terms,
-            slate_size=data_args.slate_size,
+            slate_size=train_dataset.max_slate_size,
             batch_size=training_args.per_device_train_batch_size,
         ):
             logger.warning(warning)

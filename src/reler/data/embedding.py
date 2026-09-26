@@ -1,9 +1,7 @@
 import glob
-import hashlib
 import json
 import os
 import random
-import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Sequence
@@ -13,77 +11,18 @@ import torch.nn.functional as F
 import transformers
 from torch.utils.data import Dataset, Sampler
 
+from .candidates import validate_candidate_record
 from .protocol import format_embedding_text, tokenize_embedding_texts
 
-
-def document_key(text):
-    """Identify duplicate documents in uncompiled teacher-ranking data."""
-    normalized = " ".join(unicodedata.normalize("NFKC", text).casefold().split())
-    return hashlib.sha256(normalized.encode()).hexdigest()
-
-
-TASK_PROMPTS = {
-    "msmarco": "Given a web search query, retrieve the documents that answer the query",
-    "nq": "Given a question, retrieve Wikipedia documents that answer the question",
-    "hotpotqa": "Given a multi-hop question, retrieve the documents that can help answer the question",
-    "trivia": "Retrieve Wikipedia documents that answer the question",
-    "t2ranking": "Given a Chinese search query, retrieve the documents that answer the query",
-    "dureader": "Given a Chinese search query, retrieve the documents that answer the query",
-    "mmarco_chinese": "Given a Chinese web search query, retrieve the documents that answer the query",
-    "cMedQAv2": "Given a Chinese medical question, retrieve the documents that answer the question",
-    "miracl": "Given a question, retrieve Wikipedia documents that answer the question",
-    "allnli": "Given a premise, retrieve a hypothesis that is entailed by the premise",
-    "fever": "Given a claim, retrieve documents that support or refute the claim",
-    "eli5_question_answer": "Given a question, retrieve the answer that explains it",
-    "squad": "Given a question, retrieve a Wikipedia passage that answers the question",
-    "quora_duplicates": "Given a question, retrieve questions that are semantically equivalent to the given question",
-    "mrtydi": "Given a question, retrieve Wikipedia documents that answer the question",
-    "mldr": "Given a query, retrieve the long documents that are relevant to the query",
-    "law_medical": "Given a Chinese question, retrieve legal or medical documents that answer the question",
-    "zh_nli": "Given a premise, retrieve a hypothesis that is entailed by the premise",
-}
-
-DEFAULT_TASK_PROMPTS = (
+DEFAULT_TASK_PROMPT = (
     "Given a query, retrieve the documents that are relevant to the query"
 )
-
-
-# Maps a BGE-M3 source subdirectory name to a TASK_PROMPTS key. Directory names whose
-# lowercased form already matches a TASK_PROMPTS key (e.g. "cMedQAv2") need no entry.
-SOURCE_DIR_TO_TASK = {
-    "msmarco": "msmarco",
-    "nq": "nq",
-    "hotpotqa": "hotpotqa",
-    "trivia": "trivia",
-    "t2ranking": "t2ranking",
-    "dureader": "dureader",
-    "mmarco-zh": "mmarco_chinese",
-    "cmedqav2": "cMedQAv2",
-    "miracl": "miracl",
-    "en_nli_data": "allnli",
-    "zh_nli_data": "zh_nli",
-    "squad": "squad",
-    "mr.tydi": "mrtydi",
-    "mrtydi": "mrtydi",
-    "mldr": "mldr",
-    "law-medical_data": "law_medical",
-}
-
-
-def _source_name_from_dir(dir_name: str) -> str:
-    """Resolve a source subdirectory name to a TASK_PROMPTS key.
-
-    Falls back to the lowercased directory name (which then hits DEFAULT_TASK_PROMPTS
-    in ``_format_query`` if it is not a registered task).
-    """
-    key = dir_name.strip().lower()
-    return SOURCE_DIR_TO_TASK.get(key, key)
 
 
 def _length_bucket_from_path(path: str) -> str:
     """Extract the ``len-<lo>-<hi>`` length-bucket tag from a data filename.
 
-    Files are named like ``dureader_len-0-500.jsonl``; the tag is what distinguishes
+    Files can be named like ``train_len-0-500.jsonl``; the tag is what distinguishes
     one length bucket from another within the same source. Returns the substring from
     ``len-`` to the extension, or an empty string when the filename carries no tag
     (so untagged files all share one bucket and behave exactly as before).
@@ -156,132 +95,6 @@ def _plan_retained_batches(
     )
 
 
-def record_to_slate(
-    record: dict[str, Any],
-    slate_size: int,
-    rng: random.Random,
-) -> dict[str, Any] | None:
-    """Convert one BGE-M3 mining record into a project slate record.
-
-    BGE-M3 records look like ``{query, pos, neg, [pos_scores], [neg_scores]}``. We take
-    one positive (highest ``pos_scores`` when present, else random) and up to
-    ``slate_size - 1`` negatives (top ``neg_scores`` when present, else shuffled).
-    The positive is at index 0. ``ranking`` is only a layout placeholder, not teacher
-    supervision. All positive text keys survive for cross-query filtering.
-    Returns ``None`` when the record has no positive or no negative.
-    """
-    positives = record.get("pos") or []
-    negatives = record.get("neg") or []
-    if not positives or not negatives:
-        return None
-    num_negatives = min(slate_size - 1, len(negatives))
-
-    pos_scores = record.get("pos_scores")
-    if pos_scores and len(pos_scores) == len(positives):
-        positive = positives[max(range(len(positives)), key=lambda i: pos_scores[i])]
-    else:
-        positive = rng.choice(positives)
-
-    neg_scores = record.get("neg_scores")
-    if neg_scores and len(neg_scores) == len(negatives):
-        order = sorted(range(len(negatives)), key=lambda i: neg_scores[i], reverse=True)
-        chosen = [negatives[i] for i in order[:num_negatives]]
-    else:
-        chosen = list(negatives)
-        rng.shuffle(chosen)
-        chosen = chosen[:num_negatives]
-
-    documents = [positive, *chosen]
-    ranking = list(range(1, len(documents) + 1))
-    return {
-        "query": record["query"],
-        "document": documents,
-        "ranking": ranking,
-        "pos_index": 1,
-        "ranking_source": "pos_neg_layout",
-        "known_positive_keys": sorted({document_key(text) for text in positives}),
-    }
-
-
-def listwise_positive_index(record: dict[str, Any], *, required: bool = False) -> int:
-    """Resolve the annotated 1-based document position, separately from teacher order."""
-    if "pos_index" not in record:
-        if required:
-            raise ValueError(
-                "Binary listwise relevance requires a 1-indexed 'pos_index'"
-            )
-        # Legacy teacher-only graded records remain readable.
-        return record["ranking"][0] - 1
-    index = record["pos_index"]
-    if (
-        isinstance(index, bool)
-        or not isinstance(index, int)
-        or not 1 <= index <= len(record["document"])
-    ):
-        raise ValueError("'pos_index' must be an integer in [1, len(document)]")
-    return index - 1
-
-
-def normalize_listwise_record(
-    record: dict[str, Any], *, preserve_document_metadata: bool = False
-) -> dict[str, Any]:
-    """Validate and normalize an E2Rank ``{query, document, ranking}`` record.
-
-    ``ranking`` is a 1-indexed permutation of document positions, ordered from most
-    to least relevant. Unlike BGE-M3 conversion, the complete candidate list and its
-    teacher ordering are preserved. Optional ``pos_index`` is the annotated 1-based
-    document position, independent of teacher order; binary collation requires it.
-    """
-    if record.get("schema") is not None or "relevance" in record:
-        raise ValueError(
-            "Use the prepared candidate format for explicit relevance records"
-        )
-    query = record.get("query")
-    documents = record.get("document")
-    ranking = record.get("ranking")
-    if not isinstance(query, str) or not query:
-        raise ValueError("Listwise record requires a non-empty string field 'query'")
-    if (
-        not isinstance(documents, list)
-        or not documents
-        or not all(isinstance(document, str) for document in documents)
-    ):
-        raise ValueError(
-            "Listwise record requires a non-empty string list field 'document'"
-        )
-    if (
-        not isinstance(ranking, list)
-        or len(ranking) != len(documents)
-        or not all(
-            isinstance(rank, int) and not isinstance(rank, bool) for rank in ranking
-        )
-    ):
-        raise ValueError(
-            "Listwise record requires an integer 'ranking' with the same length as 'document'"
-        )
-    expected = list(range(1, len(documents) + 1))
-    if sorted(ranking) != expected:
-        raise ValueError(
-            f"Listwise ranking must be a 1-indexed permutation of {expected}, got {ranking}"
-        )
-    normalized = {"query": query, "document": list(documents), "ranking": list(ranking)}
-    if "pos_index" in record:
-        normalized["pos_index"] = listwise_positive_index(record) + 1
-    if preserve_document_metadata:
-        for field_name in (
-            "document_keys",
-            "document_ids",
-            "known_document_ids",
-            "known_positive_keys",
-        ):
-            value = record.get(field_name)
-            if value is not None:
-                normalized[field_name] = (
-                    list(value) if isinstance(value, list) else value
-                )
-    return normalized
-
-
 class EmbeddingDataset(Dataset):
     query_prompt_template = "Instruct: {task_description}\nQuery:{query}"
 
@@ -290,25 +103,16 @@ class EmbeddingDataset(Dataset):
         data_args: Any,
         batch_size: int | None = None,
         query_prompt_template: str | None = None,
-        preserve_document_metadata: bool = False,
     ):
         self.batch_size = batch_size or 32
         if query_prompt_template is not None:
             self.query_prompt_template = query_prompt_template
-        self.preserve_document_metadata = preserve_document_metadata
         self.per_dataset_max_samples = data_args.per_dataset_max_samples
-        self.slate_size = getattr(data_args, "slate_size", 8)
-        # ``file_glob`` accepts a comma-separated list of patterns so several length
-        # buckets can be mixed in one run, e.g. "*_len-0-500.jsonl,*_len-500-1000.jsonl".
-        # A single-pattern string stays byte-identical to the legacy behaviour.
-        raw_file_glob = getattr(data_args, "file_glob", "*_len-0-500.jsonl")
+        raw_file_glob = getattr(data_args, "file_glob", "*.jsonl")
         self.file_glob = raw_file_glob
         self.file_globs = [g.strip() for g in raw_file_glob.split(",") if g.strip()]
         if not self.file_globs:
             raise ValueError(f"file_glob resolved to no patterns: {raw_file_glob!r}")
-        # When multiple length buckets are read, batch each bucket separately so every
-        # micro-batch holds documents of one length range (less padding waste). Off by
-        # default: single-bucket runs are then bit-for-bit unchanged.
         self.batch_per_length_bucket = getattr(
             data_args, "batch_per_length_bucket", False
         )
@@ -320,11 +124,11 @@ class EmbeddingDataset(Dataset):
         )
         self.index_cache_dir = getattr(data_args, "index_cache_dir", None)
 
-        # Lazy-loading state (L1): we keep only byte offsets in memory, not parsed rows.
-        # ``_files`` holds per-file metadata (path, source). ``entries`` is the global
+        # Keep row offsets and compact metadata in memory instead of parsed records.
+        # ``_files`` holds file paths. ``entries`` is the global
         # sample order after per-source batching + shuffling; each entry is an index into
         # ``_locations`` which stores (file_id, byte_offset). ``__getitem__`` seeks +
-        # parses + converts on demand. Per-worker file handles are opened lazily in
+        # parses + validates on demand. Per-worker file handles are opened lazily in
         # ``_handle`` so DataLoader workers each get their own fd after fork.
         self._files: list[dict[str, Any]] = []
         self._locations: list[tuple[int, int]] = []
@@ -332,77 +136,34 @@ class EmbeddingDataset(Dataset):
         self.batch_groups: dict[str, tuple[int, ...]] = {}
         self._file_handles: dict[int, Any] = {}
         self._record_sources: dict[str, list[str]] = {}
-        self._rng = random.Random()
+        self._candidate_counts: dict[str, list[int]] = {}
 
         self._discover_files(data_args.data_path)
         self._build_index()
 
     # ------------------------------------------------------------------ discovery
     def _discover_files(self, data_path: str) -> None:
-        """Populate ``self._files`` with (path, source, batch_key) for every data file.
-
-        ``source`` drives the task prompt (length-agnostic); ``batch_key`` drives
-        per-source batching and additionally splits by length bucket so every
-        micro-batch holds documents of one length range, minimising padding waste.
-        """
+        """Discover JSONL files; source identity always comes from each record."""
         if os.path.isfile(data_path):
-            source = _source_name_from_dir(os.path.basename(os.path.dirname(data_path)))
-            self._files.append(
+            paths = [data_path]
+        elif os.path.isdir(data_path):
+            paths = sorted(
                 {
-                    "path": data_path,
-                    "source": source,
-                    "batch_key": self._batch_key(source, data_path),
-                    # A standalone E2Rank file may mix tasks and carries ``source`` per
-                    # record. BGE-M3 direct-file inputs simply fall back to the parent.
-                    "source_from_record": True,
+                    path
+                    for pattern in self.file_globs
+                    for path in glob.glob(
+                        os.path.join(data_path, "**", pattern), recursive=True
+                    )
+                    if os.path.isfile(path)
                 }
             )
-            return
-
-        if not os.path.isdir(data_path):
+        else:
             raise FileNotFoundError(f"data_path does not exist: {data_path}")
-
-        # Directory input: treat each immediate subdirectory as one source, reading the
-        # files that match ``file_globs`` inside it. Files sitting directly under
-        # data_path are also picked up (source inferred from the parent directory name).
-        for entry in sorted(os.listdir(data_path)):
-            full = os.path.join(data_path, entry)
-            if os.path.isdir(full):
-                if (
-                    self.include_sources is not None
-                    and entry not in self.include_sources
-                ):
-                    continue
-                source = _source_name_from_dir(entry)
-                # Union the matches across every glob, de-duplicating so overlapping
-                # patterns never load the same file twice, then sort for stable order.
-                matched: set[str] = set()
-                for pattern in self.file_globs:
-                    matched.update(glob.glob(os.path.join(full, pattern)))
-                for path in sorted(matched):
-                    self._files.append(
-                        {
-                            "path": path,
-                            "source": source,
-                            "batch_key": self._batch_key(source, path),
-                            "source_from_record": False,
-                        }
-                    )
-            elif entry.endswith(".jsonl") or entry.endswith(".json"):
-                source = _source_name_from_dir(os.path.basename(data_path))
-                self._files.append(
-                    {
-                        "path": full,
-                        "source": source,
-                        "batch_key": self._batch_key(source, full),
-                        "source_from_record": True,
-                    }
-                )
-
-        if not self._files:
+        if not paths:
             raise FileNotFoundError(
                 f"No data files found under {data_path!r} (glob={self.file_glob!r})"
             )
+        self._files = [{"path": path} for path in paths]
 
     def _batch_key(self, source: str, path: str) -> str:
         """Batching key: ``source`` plus its length bucket when batching per length.
@@ -423,66 +184,58 @@ class EmbeddingDataset(Dataset):
             return os.path.join(self.index_cache_dir, safe + ".reler_idx.json")
         return path + ".reler_idx.json"
 
-    def _scan_offsets(
-        self,
-        path: str,
-        *,
-        source_from_record: bool = False,
-        fallback_source: str = "unknown",
-    ) -> list[int]:
-        """Return the byte offset of every line in ``path``, caching to disk.
-
-        BGE-M3 source-directory files only need byte offsets. Standalone/mixed
-        listwise files are parsed once while indexing so their per-record ``source``
-        values can preserve single-source batches; those sources are cached beside the
-        offsets. The cache is invalidated when file size or mtime changes.
-        """
+    def _scan_offsets(self, path: str) -> list[int]:
+        """Cache validated row offsets, sources and candidate counts for lazy reads."""
         cache_path = self._index_cache_path(path)
         stat = os.stat(path)
-        signature = {"size": stat.st_size, "mtime": int(stat.st_mtime)}
+        signature = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "schema": 2}
         if os.path.exists(cache_path):
             try:
-                with open(cache_path, "r") as f:
+                with open(cache_path, encoding="utf-8") as f:
                     cached = json.load(f)
-                cached_sources = cached.get("sources")
-                sources_are_usable = not source_from_record or (
-                    isinstance(cached_sources, list)
-                    and len(cached_sources) == len(cached.get("offsets", []))
-                )
-                if cached.get("signature") == signature and sources_are_usable:
-                    if source_from_record:
-                        self._record_sources[path] = cached_sources
-                    return cached["offsets"]
-            except (json.JSONDecodeError, KeyError, OSError):
+                offsets = cached["offsets"]
+                sources = cached["sources"]
+                counts = cached["candidate_counts"]
+                if cached["signature"] == signature and len(offsets) == len(
+                    sources
+                ) == len(counts):
+                    self._record_sources[path] = sources
+                    self._candidate_counts[path] = counts
+                    return offsets
+            except (json.JSONDecodeError, KeyError, TypeError, OSError):
                 pass
 
-        offsets: list[int] = []
-        sources: list[str] = []
+        offsets, sources, counts = [], [], []
         with open(path, "rb") as f:
-            offset = f.tell()
-            line = f.readline()
-            while line:
-                if line.strip():
-                    offsets.append(offset)
-                    if source_from_record:
-                        try:
-                            record = json.loads(line)
-                        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                            raise ValueError(
-                                f"Invalid JSON record in {path} at byte offset {offset}"
-                            ) from exc
-                        raw_source = record.get("source") or fallback_source
-                        sources.append(_source_name_from_dir(str(raw_source)))
+            while True:
                 offset = f.tell()
                 line = f.readline()
-        if source_from_record:
-            self._record_sources[path] = sources
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    record = validate_candidate_record(json.loads(line))
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise ValueError(
+                        f"Invalid training record in {path} at byte offset {offset}: {exc}"
+                    ) from exc
+                offsets.append(offset)
+                sources.append(record["source"])
+                counts.append(len(record["document"]))
+        self._record_sources[path] = sources
+        self._candidate_counts[path] = counts
         try:
-            with open(cache_path, "w") as f:
-                cached_index = {"signature": signature, "offsets": offsets}
-                if source_from_record:
-                    cached_index["sources"] = sources
-                json.dump(cached_index, f)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "signature": signature,
+                        "offsets": offsets,
+                        "sources": sources,
+                        "candidate_counts": counts,
+                    },
+                    f,
+                )
         except OSError as exc:
             print(f"Warning: could not write offset cache {cache_path}: {exc}")
         return offsets
@@ -498,28 +251,23 @@ class EmbeddingDataset(Dataset):
         """
         locations_by_source: dict[str, list[int]] = defaultdict(list)
         batch_key_by_location: dict[int, str] = {}
+        candidate_count_by_location: list[int] = []
         for file_id, meta in enumerate(self._files):
-            offsets = self._scan_offsets(
-                meta["path"],
-                source_from_record=meta["source_from_record"],
-                fallback_source=meta["source"],
-            )
-            record_sources = self._record_sources.get(meta["path"])
-            for record_index, offset in enumerate(offsets):
-                source = (
-                    record_sources[record_index]
-                    if record_sources is not None
-                    else meta["source"]
-                )
-                batch_key = (
-                    self._batch_key(source, meta["path"])
-                    if meta["source_from_record"]
-                    else meta["batch_key"]
-                )
+            path = meta["path"]
+            offsets = self._scan_offsets(path)
+            for offset, source, count in zip(
+                offsets, self._record_sources[path], self._candidate_counts[path]
+            ):
+                if (
+                    self.include_sources is not None
+                    and source not in self.include_sources
+                ):
+                    continue
                 location_id = len(self._locations)
                 self._locations.append((file_id, offset))
+                candidate_count_by_location.append(count)
                 locations_by_source[source].append(location_id)
-                batch_key_by_location[location_id] = batch_key
+                batch_key_by_location[location_id] = self._batch_key(source, path)
 
         self._batch_layout = _plan_retained_batches(
             locations_by_source,
@@ -535,6 +283,9 @@ class EmbeddingDataset(Dataset):
         self.entries = list(self._batch_layout.entries)
         self.batch_groups = dict(self._batch_layout.groups)
         self.num_batches = self._batch_layout.num_batches
+        self.max_slate_size = max(
+            (candidate_count_by_location[index] for index in self.entries), default=0
+        )
         print(
             f"Indexed {len(self.entries)} samples in "
             f"{self.num_batches} single-source batches "
@@ -545,18 +296,17 @@ class EmbeddingDataset(Dataset):
     def __len__(self) -> int:
         return len(self.entries)
 
-    def _format_query(self, task_name: str, query: str) -> str:
-        retrieval_prompt = TASK_PROMPTS.get(task_name, DEFAULT_TASK_PROMPTS)
+    def _format_query(self, query: str) -> str:
         return format_embedding_text(
             self.query_prompt_template,
             query,
-            task_description=retrieval_prompt,
+            task_description=DEFAULT_TASK_PROMPT,
         )
 
     def _handle(self, file_id: int):
         handle = self._file_handles.get(file_id)
         if handle is None:
-            handle = open(self._files[file_id]["path"], "r")
+            handle = open(self._files[file_id]["path"], "rb")
             self._file_handles[file_id] = handle
         return handle
 
@@ -580,65 +330,15 @@ class EmbeddingDataset(Dataset):
         handle.seek(offset)
         return json.loads(handle.readline())
 
-    def _convert(self, file_id: int, record: dict[str, Any]) -> dict[str, Any] | None:
-        if record.get("schema") in {
-            "embedding_candidates_v1",
-            "embedding_candidates_v2",
-        }:
-            converted = dict(record)
-        elif "positive" in record or "negatives" in record:
-            raise ValueError(
-                "Compile public records during preprocessing and load train.ready.jsonl"
-            )
-        elif "document" in record or "ranking" in record:
-            if "document" not in record or "ranking" not in record:
-                raise ValueError(
-                    "Listwise records must contain both 'document' and 'ranking'"
-                )
-            converted = normalize_listwise_record(
-                record,
-                preserve_document_metadata=self.preserve_document_metadata,
-            )
-        elif "pos" in record or "neg" in record:
-            converted = record_to_slate(record, self.slate_size, self._rng)
-        else:
-            raise ValueError(
-                "Unsupported training record schema: expected either "
-                "{query, document, ranking} or {query, pos, neg}"
-            )
-        if converted is None:
-            return None
-        raw_source = record.get("source") or self._files[file_id]["source"]
-        source = _source_name_from_dir(str(raw_source))
-        converted["source"] = source
-        converted["query"] = self._format_query(source, converted["query"])
-        return converted
-
     def __getitem__(self, index: int) -> dict[str, Any]:
-        # Resolve within the original storage block so an unusable BGE-M3 record
-        # (no positive or negative) is replaced within the same source/length bucket.
-        # This block need not be the current epoch's micro-batch. Variable slate
-        # lengths are padded and masked by the collator.
-        batch_start = (index // self.batch_size) * self.batch_size
-        batch_end = min(batch_start + self.batch_size, len(self.entries))
-        order = [index] + [i for i in range(batch_start, batch_end) if i != index]
-        for candidate in order:
-            location_id = self.entries[candidate]
-            file_id, _ = self._locations[location_id]
-            record = self._read_record(location_id)
-            converted = self._convert(file_id, record)
-            if converted is not None:
-                return converted
-        raise RuntimeError(
-            f"No convertible sample in batch starting at {batch_start}; "
-            "records may be missing positives or negatives."
-        )
+        record = validate_candidate_record(self._read_record(self.entries[index]))
+        return {**record, "query": self._format_query(record["query"])}
 
 
 class SingleSourceBatchSampler(Sampler[int]):
     """Recombine retained samples into single-source micro-batches each epoch.
 
-    ``EmbeddingDataset`` applies the source cap, optional dev split and per-group
+    ``EmbeddingDataset`` applies the source cap and per-group
     tail dropping once. This sampler shuffles the retained indices within each
     source (and length bucket when enabled), then shuffles the resulting full
     micro-batches. In-batch companions can change without mixing sources or changing
@@ -696,64 +396,6 @@ class SingleSourceBatchSampler(Sampler[int]):
             yield from batches[batch_index]
 
 
-def build_relevance_labels(
-    ranking: torch.Tensor,
-    scheme: str = "graded",
-) -> torch.Tensor:
-    if ranking is None:
-        raise ValueError("ranking is required to build relevance labels")
-    if ranking.dim() != 2:
-        raise ValueError(
-            f"ranking must be a 2D tensor, got shape {tuple(ranking.shape)}"
-        )
-    if scheme not in {"graded", "binary"}:
-        raise ValueError(f"Unsupported relevance scheme: {scheme}")
-
-    batch_size, slate_length = ranking.shape
-    relevance = torch.zeros(
-        batch_size, slate_length, device=ranking.device, dtype=torch.float32
-    )
-
-    rank_scores = torch.zeros(slate_length, device=ranking.device, dtype=torch.float32)
-    if slate_length > 0:
-        rank_scores[0] = 3.0 if scheme == "graded" else 1.0
-    if scheme == "graded":
-        if slate_length > 1:
-            rank_scores[1 : min(5, slate_length)] = 2.0
-        if slate_length > 5:
-            rank_scores[5 : min(10, slate_length)] = 1.0
-
-    relevance.scatter_(
-        dim=1,
-        index=ranking,
-        src=rank_scores.unsqueeze(0).expand(batch_size, -1),
-    )
-    return relevance
-
-
-def build_rank_labels(ranking: torch.Tensor) -> torch.Tensor:
-    """Invert a 0-indexed teacher permutation into dense higher-is-better labels."""
-    if ranking.dim() != 2:
-        raise ValueError(
-            f"ranking must be a 2D tensor, got shape {tuple(ranking.shape)}"
-        )
-    batch_size, slate_length = ranking.shape
-    labels = torch.zeros_like(ranking, dtype=torch.float32)
-    rank_values = torch.arange(
-        slate_length,
-        0,
-        -1,
-        device=ranking.device,
-        dtype=torch.float32,
-    )
-    labels.scatter_(
-        dim=1,
-        index=ranking,
-        src=rank_values.unsqueeze(0).expand(batch_size, -1),
-    )
-    return labels
-
-
 def build_slate_inputs(
     positive_document: Dict[str, torch.Tensor],
     negative_document: Dict[str, torch.Tensor],
@@ -762,8 +404,8 @@ def build_slate_inputs(
 ) -> Dict[str, torch.Tensor]:
     """Re-interleave the collator's split tensors into one flat ``[batch * slate, ...]`` batch.
 
-    ``EmbeddingDataCollator`` emits every sample's gold positive in ``positive_document``
-    (``[batch, ...]``) and all negatives in ``negative_document``, ordered sample-major
+    ``EmbeddingDataCollator`` emits every sample's representative positive in ``positive_document``
+    (``[batch, ...]``) and all remaining candidates in ``negative_document``, ordered sample-major
     (``[batch * (slate - 1), ...]``). Encoding them needs a single flat batch whose rows read
     ``(sample 0 positive, sample 0 negatives..., sample 1 positive, ...)`` so that the
     ``reshape(batch, slate, -1)`` on the far side puts each sample's own candidates into its
@@ -803,31 +445,15 @@ def build_candidate_layout(
     *,
     relevance_scheme: str,
     include_cross_batch_metadata: bool = False,
-    use_unprepared_document_metadata: bool = False,
 ) -> CandidateLayout:
-    """Build labels, masks and candidate order shared by both training modes.
-
-    Joint training retains its historical text-hash identity for raw listwise rows.
-    Fixed-corpus callers opt into explicit keys on those rows so the key used for
-    ordinal lookup remains stable even when its text representation changes.
-    """
-    explicit = ["relevance" in instance for instance in instances]
-    if any(
-        "relevance" in item
-        and item.get("schema")
-        not in {"embedding_candidates_v1", "embedding_candidates_v2"}
-        for item in instances
-    ):
-        raise ValueError(
-            "Explicit relevance must use preprocessed embedding_candidates_v1/v2 records"
-        )
-    if any(explicit) and not all(explicit):
-        raise ValueError(
-            "Do not mix explicit relevance and teacher-grade records in one batch"
-        )
+    """Build labels and identity masks without changing prepared candidate order."""
+    if relevance_scheme not in {"binary", "graded"}:
+        raise ValueError(f"Unsupported relevance_scheme: {relevance_scheme}")
+    if not instances:
+        raise ValueError("At least one training record is required")
+    for instance in instances:
+        validate_candidate_record(instance)
     width = max(len(instance["document"]) for instance in instances)
-    if width < 2:
-        raise ValueError("At least two candidates are required")
 
     positive_documents, negative_documents = [], []
     ordered_keys, known_id_sets, known_positive_key_sets = [], [], []
@@ -841,94 +467,31 @@ def build_candidate_layout(
     for instance in instances:
         docs = instance["document"]
         n = len(docs)
-        ready = instance.get("schema") in {
-            "embedding_candidates_v1",
-            "embedding_candidates_v2",
-        }
-        if ready:
-            labels = torch.tensor(instance["relevance"], dtype=torch.float32)
-            ranks = torch.tensor(instance["rank_labels"], dtype=torch.float32)
-            if (
-                len(labels) != n
-                or len(ranks) != n
-                or labels[0] != 1
-                or not ((labels == 0) | (labels == 1)).all()
-            ):
-                raise ValueError(
-                    "Prepared binary labels must match candidates with a representative positive first"
-                )
-            binary_positive = labels.bool()
-            if relevance_scheme == "graded":
-                labels = torch.tensor(instance["graded_relevance"], dtype=torch.float32)
-                if len(labels) != n:
-                    raise ValueError("Prepared grades must match candidates")
-            positive_index = 0
-        else:
-            mined = instance.get("ranking_source") == "pos_neg_layout"
-            if mined and relevance_scheme != "binary":
-                raise ValueError(
-                    "BGE-M3 pos/neg data requires binary relevance; candidate order "
-                    "is not a teacher ranking for graded supervision"
-                )
-            ranking = torch.tensor([instance["ranking"]], dtype=torch.long) - 1
-            ranks = build_rank_labels(ranking)[0]
-            positive_index = listwise_positive_index(
-                instance, required=relevance_scheme == "binary"
-            )
-            binary_positive = torch.zeros(n, dtype=torch.bool)
-            binary_positive[positive_index] = True
-            labels = (
-                binary_positive.float()
-                if relevance_scheme == "binary"
-                else build_relevance_labels(ranking, "graded")[0]
-            )
-            if mined:
-                # No preference is annotated between mined negatives.
-                ranks = binary_positive.float()
-        order = (
-            list(range(n))
-            if ready
-            else [positive_index] + [i for i in range(n) if i != positive_index]
+        binary_positive = torch.tensor(instance["relevance"], dtype=torch.bool)
+        label_field = (
+            "relevance" if relevance_scheme == "binary" else "graded_relevance"
         )
-        reordered = [docs[i] for i in order]
-        positive_documents.append(reordered[0])
-        negative_documents.extend(reordered[1:] + [""] * (width - n))
-        relevance_labels.append(F.pad(labels[order], (0, width - n)))
-        positive_masks.append(F.pad(binary_positive[order], (0, width - n)))
-        rank_labels.append(F.pad(ranks[order], (0, width - n)))
+        labels = torch.tensor(instance[label_field], dtype=torch.float32)
+        ranks = torch.tensor(instance["rank_labels"], dtype=torch.float32)
+        positive_documents.append(docs[0])
+        negative_documents.extend(docs[1:] + [""] * (width - n))
+        relevance_labels.append(F.pad(labels, (0, width - n)))
+        positive_masks.append(F.pad(binary_positive, (0, width - n)))
+        rank_labels.append(F.pad(ranks, (0, width - n)))
         masks.append([True] * n + [False] * (width - n))
-        use_metadata = ready or use_unprepared_document_metadata
-        ids = instance.get("document_ids") if use_metadata else None
-        if ids is None:
-            ids = [None] * n
-        elif not isinstance(ids, list):
-            raise ValueError("document_ids must be a list")
-        if len(ids) != n:
-            raise ValueError("document_ids must match document count")
-        ordered_ids.append([ids[i] for i in order] + [None] * (width - n))
-        keys = instance.get("document_keys") if use_metadata else None
-        if keys is None:
-            keys = [document_key(document) for document in docs]
-        elif not isinstance(keys, list):
-            raise ValueError("document_keys must be a list")
-        if len(keys) != n:
-            raise ValueError("document_keys must match document count")
-        if any(not isinstance(key, str) or not key for key in keys):
-            raise ValueError(
-                "document_keys must contain one non-empty string per candidate"
-            )
-        ordered_keys.append([keys[i] for i in order] + [None] * (width - n))
-        if ready:
-            known_ids = set(instance["known_document_ids"])
-        elif use_unprepared_document_metadata:
-            known_ids = set(instance.get("known_document_ids", [])) | set(ids)
-        else:
-            known_ids = set()
-        known_id_sets.append(known_ids - {None, ""})
+        ordered_ids.append(instance["document_ids"] + [None] * (width - n))
+        ordered_keys.append(instance["document_keys"] + [None] * (width - n))
+        known_id_sets.append(
+            set(instance["known_document_ids"]) | set(instance["document_ids"])
+        )
         known_positive_key_sets.append(
-            set(instance.get("known_positive_keys", []))
-            if ready or use_unprepared_document_metadata or mined
-            else set()
+            {
+                key
+                for key, positive in zip(
+                    instance["document_keys"], instance["relevance"]
+                )
+                if positive
+            }
         )
 
     batch_size = len(instances)
@@ -1025,6 +588,11 @@ class EmbeddingDataCollator:
         print(f"use ``{self.tokenizer.pad_token}`` as pad token for llm")
 
     def __call__(self, instances: Sequence[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        layout = build_candidate_layout(
+            instances,
+            relevance_scheme=self.relevance_scheme,
+            include_cross_batch_metadata=self.include_cross_batch_metadata,
+        )
         query_inputs = tokenize_embedding_texts(
             [instance["query"] for instance in instances],
             self.tokenizer,
@@ -1032,11 +600,6 @@ class EmbeddingDataCollator:
             max_length=self.query_max_length,
         )
 
-        layout = build_candidate_layout(
-            instances,
-            relevance_scheme=self.relevance_scheme,
-            include_cross_batch_metadata=self.include_cross_batch_metadata,
-        )
         result = {"query": query_inputs, **layout.batch}
         batch_size = len(instances)
         documents = [

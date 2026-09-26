@@ -11,6 +11,8 @@ from accelerate.data_loader import prepare_data_loader
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from candidate_helpers import candidate_record
+
 from reler.config import DataArguments
 from reler.data.embedding import EmbeddingDataset, SingleSourceBatchSampler
 from reler.training.trainer import build_single_source_sampler
@@ -19,9 +21,8 @@ from reler.training.trainer import build_single_source_sampler
 def write_records(path, source_counts, bucket="short"):
     path.parent.mkdir(parents=True, exist_ok=True)
     records = [
-        dict(id=f"{source}-{bucket}-{i}", schema="embedding_candidates_v2",
-             source=source, bucket=bucket, query=f"query {i}", document=["a", "b"],
-             relevance=[1, 0], ranking=[1, 2])
+        candidate_record(["a", "b"], id=f"{source}-{bucket}-{i}",
+                         source=source, bucket=bucket, query=f"query {i}")
         for source, count in source_counts.items() for i in range(count)
     ]
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
@@ -29,7 +30,7 @@ def write_records(path, source_counts, bucket="short"):
 
 def make_dataset(path, **kwargs):
     random.seed(42)
-    args = DataArguments(data_path=str(path), per_dataset_max_samples=None, **kwargs)
+    args = DataArguments(data_path=str(path), **kwargs)
     return EmbeddingDataset(args, batch_size=4)
 
 
@@ -209,3 +210,53 @@ def test_empty_and_single_batch_groups(tmp_path, count):
             assert sorted(sampler) == list(range((count // 4) * 4))
     finally:
         data.close()
+
+
+@pytest.mark.parametrize("directory_input", [False, True])
+def test_source_filter_and_cap_use_record_metadata_on_cold_and_cached_reads(tmp_path, directory_input):
+    # Folder names need not agree with sources, and one file can mix sources.
+    path = tmp_path / "unrelated-folder" / "train.ready.jsonl"
+    write_records(path, {"biology": 12, "economics": 8})
+    (path.parent / "ignore.jsonl").write_text('{"not": "training data"}\n')
+    data_path = tmp_path if directory_input else path
+    observed = []
+    for _ in range(2):
+        data = make_dataset(data_path, file_glob="*.ready.jsonl,train.ready.jsonl",
+                            include_sources="economics", per_dataset_max_samples=5)
+        try:
+            rows = [data[i] for i in range(len(data))]
+            assert len(rows) == 4
+            assert {row["source"] for row in rows} == {"economics"}
+            assert data.max_slate_size == 2
+            observed.append([row["id"] for row in rows])
+        finally:
+            data.close()
+    assert observed[0] == observed[1]
+
+
+def test_utf8_offsets_preserve_prepared_candidates_and_labels(tmp_path):
+    path = tmp_path / "train.ready.jsonl"
+    records = [candidate_record(["正文", "another", "third"] if i % 2 else ["正例", "负例"],
+                                id=str(i), query=f"查询 {i}") for i in range(8)]
+    path.write_text("\n" + "\n\n".join(json.dumps(row, ensure_ascii=False) for row in records),
+                    encoding="utf-8")
+    for _ in range(2):
+        data = make_dataset(path)
+        try:
+            assert data.max_slate_size == 3
+            actual = {row["id"]: row for row in data}
+            for record in records:
+                for field in ("document", "relevance", "graded_relevance", "rank_labels",
+                              "document_ids", "document_keys", "known_document_ids"):
+                    assert actual[record["id"]][field] == record[field]
+        finally:
+            data.close()
+
+
+def test_invalid_row_is_rejected_even_when_it_would_be_dropped(tmp_path):
+    path = tmp_path / "train.ready.jsonl"
+    write_records(path, {"biology": 4})
+    with path.open("a") as stream:
+        stream.write(json.dumps(candidate_record(relevance=[0, 1])) + "\n")
+    with pytest.raises(ValueError):
+        make_dataset(path)

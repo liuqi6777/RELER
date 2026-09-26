@@ -2,7 +2,7 @@
 # RankNet or LambdaLoss without changing the training entrypoint.
 _base_:
   - ../train/full_finetune.yaml
-  - ../dataset/e2rank_listwise.yaml
+  - ../dataset/prepared.yaml
   - ../model/qwen3_embedding_0.6b.yaml
   - ../baseline/infonce_in_batch.yaml
 

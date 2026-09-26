@@ -2,7 +2,7 @@
 
 RELER is a compact training codebase for text embeddings. It supports supervised ranking objectives (InfoNCE, RankNet, and LambdaLoss), joint query/document GRPO, and optional query-only GRPO against an immutable document corpus.
 
-The public workflow is deliberately small: choose a data schema, compose a model and training configuration, train either a joint encoder or a query encoder against fixed documents, then evaluate the saved checkpoint with MTEB.
+The public workflow is deliberately small: provide prepared candidate data, compose a model and training configuration, train either a joint encoder or a query encoder against fixed documents, then evaluate the saved checkpoint with MTEB.
 
 ## Setup
 
@@ -15,43 +15,56 @@ source .venv/bin/activate
 
 ## Training data
 
-Training input is JSONL. Each record must use one of the supported schemas below.
-
-### E2Rank listwise schema
+Training input is local JSONL using only `embedding_candidates_v2`. Each record
+contains the complete prepared candidate list:
 
 ```json
 {
+  "schema": "embedding_candidates_v2",
+  "id": "sample-1",
+  "source": "task-a",
   "query": "user query",
   "document": ["candidate A", "candidate B", "candidate C"],
-  "ranking": [2, 1, 3],
-  "source": "optional-task-name"
+  "document_ids": ["a", "b", "c"],
+  "document_keys": ["text-key-a", "text-key-b", "text-key-c"],
+  "known_document_ids": ["a", "b", "c", "d"],
+  "relevance": [1, 1, 0],
+  "graded_relevance": [1, 2, 3],
+  "rank_labels": [1, 2, 3]
 }
 ```
 
-`ranking` is a 1-indexed permutation of positions in `document`, ordered from most to least relevant. This schema retains the full teacher order and supports graded relevance, RankNet, LambdaLoss, and ranking rewards. `configs/dataset/e2rank_listwise.yaml` is the corresponding dataset configuration.
+All displayed fields are required. Candidate-aligned arrays have the same length
+as `document`; at least two candidates and one binary negative are required.
+The first candidate is the preselected positive representative. The loader keeps
+all candidates, their order, and every positive label; it does not sample or
+truncate the candidate list. Variable lengths are padded and masked within a batch.
 
-### Binary positive/negative schema
+- `relevance` contains binary labels, including any additional positives.
+  It defines the positive mask for contrastive learning independently of teacher labels.
+- `graded_relevance` contains teacher grades in 0–3. `relevance_scheme: graded`
+  uses these for ranking rewards and graded losses; `binary` uses `relevance`.
+- `rank_labels` is a permutation of 1 through the candidate count, aligned with
+  `document`. Larger values mean higher teacher preference; these values are
+  per-document scores, not a permutation of document positions to apply.
+- `document_ids` are strings scoped by `source`. `known_document_ids` lists known
+  documents to exclude from cross-query pools, including candidates absent from
+  this record. It does not assign positive labels.
+- `document_keys` are precomputed normalized-text deduplication keys shared across
+  sources (typically SHA-256, abbreviated above). They filter duplicate candidates
+  and identify documents in an index built from the training data.
 
-```json
-{
-  "query": "user query",
-  "pos": ["relevant passage"],
-  "neg": ["non-relevant passage 1", "non-relevant passage 2"],
-  "pos_scores": [1.0],
-  "neg_scores": [0.8, 0.4]
-}
-```
-
-`pos_scores` and `neg_scores` are optional. The loader selects one positive and fills the rest of the candidate slate from negatives; this schema is binary-only. Preprocessed `embedding_candidates_v1` and `embedding_candidates_v2` records are also accepted when candidate-level relevance has already been materialized.
-
-All records in a batch must be compatible with the selected `relevance_scheme`. Set the data path, candidate `slate_size`, query/document lengths, source filters, and optional per-source cap in a dataset config.
+Use `configs/dataset/prepared.yaml` and set `data_path` to a file or directory.
+Directory inputs match `file_glob` recursively. `source` always comes from each
+record and controls single-source batching, optional filtering, and the per-source
+sample cap. Incomplete source batches are dropped once before epoch shuffling.
 
 ## Configuration model
 
 Configuration files are composable YAML fragments under `configs/`:
 
 - `configs/train/`: optimizer, precision, batch size, epochs, checkpointing, and LoRA.
-- `configs/dataset/`: input schema, paths, lengths, candidate slate, and source sampling.
+- `configs/dataset/`: input paths, token lengths, and source sampling.
 - `configs/model/`: backbone plus the embedding protocol.
 - `configs/baseline/`: supervised objective and its hyperparameters.
 - `configs/grpo/` and `configs/reward/`: GRPO policy and retrieval reward.
@@ -66,7 +79,7 @@ Use the unified `reler-train` CLI directly for one process, or the thin
 
 ```bash
 NPROC_PER_NODE=1 bash scripts/run_supervised.sh configs/examples/supervised.yaml \
-  --data_path /path/to/train.jsonl \
+  --data_path /path/to/train.ready.jsonl \
   --output_dir checkpoints/reler-infonce
 ```
 
@@ -88,7 +101,7 @@ The GRPO example composes the train, dataset, model, GRPO, and reward fragments:
 
 ```bash
 NPROC_PER_NODE=1 bash scripts/run_grpo.sh configs/examples/grpo.yaml \
-  --data_path /path/to/train.jsonl \
+  --data_path /path/to/train.ready.jsonl \
   --output_dir checkpoints/reler-grpo
 ```
 
@@ -111,7 +124,7 @@ Fixed-corpus training encodes documents once, then trains only the query encoder
 
 ```bash
 reler-index \
-  --input /path/to/train.jsonl \
+  --input /path/to/train.ready.jsonl \
   --input-format training_candidates \
   --output-dir artifacts/reler-corpus \
   --model-config configs/model/qwen3_embedding_0.6b.yaml \
@@ -119,14 +132,19 @@ reler-index \
   --num-shards 16
 ```
 
-Raw listwise and `pos`/`neg` RELER records are accepted. Explicit `document_ids` are preferred; otherwise the same normalized-text key used by the training collator is generated. The resulting directory contains the embedding protocol, a document-to-ordinal mapping, and vector shards.
+The builder reads the same prepared training records and uses `document_keys`
+for global document identity, since `document_ids` may repeat across sources.
+The resulting directory contains the embedding protocol, a document-to-ordinal
+mapping, and vector shards. A separately supplied corpus can instead use
+`--input-format document_jsonl` with `{id, content}` records; its IDs must match
+the training records' document keys or unambiguous document IDs.
 
 Train with the dedicated mode so index concerns remain outside ordinary GRPO:
 
 ```bash
 NPROC_PER_NODE=1 bash scripts/run_fixed_grpo.sh \
   configs/examples/fixed_grpo.yaml \
-  --data_path /path/to/train.jsonl \
+  --data_path /path/to/train.ready.jsonl \
   --index_dir artifacts/reler-corpus \
   --output_dir checkpoints/reler-fixed-grpo
 ```

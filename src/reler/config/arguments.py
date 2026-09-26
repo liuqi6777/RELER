@@ -438,24 +438,12 @@ class DataArguments:
         default="binary",
         metadata={"help": "Relevance labels: binary or graded"},
     )
-    slate_size: int = field(
-        default=8,
-        metadata={
-            "help": (
-                "Maximum candidate documents per sample (1 positive + up to "
-                "slate_size-1 negatives). Shorter samples are padded and masked per batch."
-            )
-        },
-    )
     file_glob: str = field(
-        default="*_len-0-500.jsonl",
+        default="*.jsonl",
         metadata={
             "help": (
-                "Filename glob(s) used to pick which length bucket(s) to read from each "
-                "source subdirectory when data_path is a directory. Accepts a "
-                "comma-separated list to mix buckets, e.g. "
-                "'*_len-0-500.jsonl,*_len-500-1000.jsonl'; matches are unioned and "
-                "de-duplicated."
+                "Comma-separated JSONL filename globs, matched recursively when "
+                "data_path is a directory. Overlapping matches are loaded once."
             )
         },
     )
@@ -475,8 +463,8 @@ class DataArguments:
         default=None,
         metadata={
             "help": (
-                "Comma-separated source subdirectory names to include (e.g. "
-                "'MSMARCO,NQ,HotpotQA'). None includes every subdirectory under data_path."
+                "Comma-separated record source values to include. "
+                "None includes every source, for both file and directory inputs."
             )
         },
     )
@@ -493,8 +481,6 @@ class DataArguments:
     def __post_init__(self) -> None:
         if self.relevance_scheme not in {"binary", "graded"}:
             raise ValueError(f"Unsupported relevance_scheme: {self.relevance_scheme}")
-        if self.slate_size < 2:
-            raise ValueError(f"slate_size must be >= 2, got {self.slate_size}")
 
 
 @dataclass(frozen=True)

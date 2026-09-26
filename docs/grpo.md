@@ -78,15 +78,16 @@ policy, and reward fragments for joint own-candidate training: graded nDCG@10
 plus pairwise weight 0.5, CMP, 64 actions per side, fixed alignment 0.70, and
 113 optimizer steps. The inherited batch size is 16 per GPU, giving a global
 batch of 128 with eight GPUs and no accumulation. Supply prepared training data
-with both teacher rankings and original positive identities through `--data_path`.
+in `embedding_candidates_v2` format with teacher labels and positive identities
+through `--data_path`; see the [data contract](../README.md#training-data).
 
 ```bash
 NPROC_PER_NODE=8 bash scripts/run_grpo.sh configs/examples/reler.yaml \
-  --data_path /path/to/train.jsonl
+  --data_path /path/to/train.ready.jsonl
 
 # Same reward and sampled policy, with CMP disabled in both reward components.
 NPROC_PER_NODE=8 bash scripts/run_grpo.sh configs/examples/reler.yaml \
-  --data_path /path/to/train.jsonl \
+  --data_path /path/to/train.ready.jsonl \
   --gradient_estimator score_function \
   --output_dir checkpoints/reler-rloo
 ```

@@ -1,20 +1,17 @@
-"""Behavioral contracts for listwise data, identity masks, and padded slates."""
+"""Prepared labels, document identity, and variable candidate training contracts."""
 
-import random
+from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
+from candidate_helpers import candidate_record
 
 from reler.config import BaselineArguments, RLArguments
-from reler.data.embedding import (
-    EmbeddingDataCollator,
-    normalize_listwise_record,
-    record_to_slate,
-)
+from reler.data.candidates import validate_candidate_record
+from reler.data.embedding import EmbeddingDataCollator, build_candidate_layout
 from reler.training.grpo_model import GRPOModel
-from reler.training.supervised import BaselineModel, compute_ranknet_loss
+from reler.training.supervised import BaselineModel
 
 
 class ToyTokenizer:
@@ -46,217 +43,155 @@ def collator(relevance_scheme="binary"):
     )
 
 
-def test_annotated_positive_and_teacher_order_remain_independent():
-    # Document 3 is the annotated positive but document 2 is the teacher favorite.
-    record = normalize_listwise_record(
-        {
-            "query": "query",
-            "document": ["a", "b", "c", "d", "e", "f"],
-            "ranking": [2, 1, 4, 5, 6, 3],
-            "pos_index": 3,
-        }
+def test_multiple_positives_and_teacher_order_remain_independent():
+    record = candidate_record(
+        ["a", "b", "c", "d", "e", "f"],
+        relevance=[1, 1, 0, 0, 0, 0],
+        rank_labels=[1, 5, 6, 4, 3, 2],
+        graded_relevance=[1, 2, 3, 2, 2, 2],
     )
+    original = deepcopy(record)
     binary = collator("binary")([record])
     graded = collator("graded")([record])
 
-    expected_positive = [[True, False, False, False, False, False]]
-    expected_ranks = [[1, 5, 6, 4, 3, 2]]
-    assert binary["positive_mask"].tolist() == expected_positive
-    assert graded["positive_mask"].tolist() == expected_positive
-    assert binary["rank_labels"].tolist() == expected_ranks
-    assert graded["rank_labels"].tolist() == expected_ranks
-    assert binary["relevance_labels"].tolist() == [[1, 0, 0, 0, 0, 0]]
+    expected_positive = [[True, True, False, False, False, False]]
+    for batch in (binary, graded):
+        assert batch["positive_mask"].tolist() == expected_positive
+        assert batch["rank_labels"].tolist() == [[1, 5, 6, 4, 3, 2]]
+    assert binary["relevance_labels"].tolist() == [[1, 1, 0, 0, 0, 0]]
     assert graded["relevance_labels"].tolist() == [[1, 2, 3, 2, 2, 2]]
-
+    assert record == original
     model = BaselineModel(TrackingBackbone(), BaselineArguments())
     torch.testing.assert_close(model(**binary).loss, model(**graded).loss)
 
 
-@pytest.mark.parametrize("invalid", [0, 4, -1, True, 1.5, "2", None])
-def test_listwise_positive_index_is_validated(invalid):
-    raw = {
-        "query": "query",
-        "document": ["a", "b", "c"],
-        "ranking": [2, 3, 1],
-        "pos_index": invalid,
-    }
-    with pytest.raises(ValueError, match="pos_index"):
-        normalize_listwise_record(raw)
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"schema": "embedding_candidates_v1"},
+        {"schema": None},
+        {"query": ""},
+        {"query": None},
+        {"query": 2},
+        {"id": None},
+        {"source": 1},
+        {"document": ["only"]},
+        {"document": ["a", ""]},
+        {"document_ids": ["a"]},
+        {"document_ids": ["a", None]},
+        {"document_keys": []},
+        {"known_document_ids": "a"},
+        {"known_document_ids": [1]},
+        {"relevance": [0, 1]},
+        {"relevance": [1, 1]},
+        {"relevance": [1, 2]},
+        {"relevance": [True, False]},
+        {"relevance": [1.0, 0.0]},
+        {"graded_relevance": [3]},
+        {"graded_relevance": [3, -1]},
+        {"graded_relevance": [4, 0]},
+        {"graded_relevance": [float("nan"), 0]},
+        {"rank_labels": [2, 2]},
+        {"rank_labels": [2, 0]},
+        {"rank_labels": [2, True]},
+        {"rank_labels": [[2], [1]]},
+    ],
+)
+def test_invalid_prepared_records_fail_before_tensor_construction(overrides):
+    record = candidate_record(**overrides)
+    with pytest.raises(ValueError):
+        validate_candidate_record(record)
+    with pytest.raises(ValueError):
+        collator()([record])
 
 
-def test_binary_listwise_data_requires_an_annotated_positive():
-    record = normalize_listwise_record(
-        {
-            "query": "query",
-            "document": ["a", "b", "c"],
-            "ranking": [2, 3, 1],
-        }
-    )
-    with pytest.raises(ValueError, match="pos_index"):
-        collator("binary")([record])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "schema",
+        "id",
+        "query",
+        "source",
+        "document",
+        "document_ids",
+        "document_keys",
+        "known_document_ids",
+        "relevance",
+        "graded_relevance",
+        "rank_labels",
+    ],
+)
+def test_required_fields_cannot_silently_fall_back(field):
+    record = candidate_record()
+    del record[field]
+    with pytest.raises(ValueError):
+        validate_candidate_record(record)
 
 
-def test_text_identity_filters_cross_query_false_negatives_without_document_ids():
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"query": "q", "document": ["a", "b"], "ranking": [1, 2]},
+        {"query": "q", "pos": ["a"], "neg": ["b"]},
+    ],
+)
+def test_unprepared_formats_are_rejected(record):
+    with pytest.raises(ValueError):
+        collator()([record])
+
+
+def test_precomputed_text_keys_filter_duplicates_across_sources():
     records = [
-        normalize_listwise_record(
-            {
-                "query": "q",
-                "document": ["Alpha", "Beta"],
-                "ranking": [1, 2],
-                "pos_index": 1,
-            }
-        ),
-        normalize_listwise_record(
-            {
-                "query": "r",
-                "document": [" alpha ", "Gamma", "Delta"],
-                "ranking": [1, 2, 3],
-                "pos_index": 1,
-            }
+        candidate_record(["Alpha", "Beta"], source="first"),
+        candidate_record(
+            ["different rendering", "Gamma", "Delta"],
+            source="second",
+            document_keys=[
+                candidate_record(["Alpha", "Beta"])["document_keys"][0],
+                "g",
+                "d",
+            ],
         ),
     ]
     batch = collator()(records)
-    assert batch["in_batch_positive_mask"].tolist() == [
-        [False, False],
-        [False, False],
-    ]
-    assert batch["in_batch_candidate_mask"][0, 1].tolist() == [
-        False,
-        True,
-        True,
-    ]
-    assert batch["in_batch_candidate_mask"][1, 0].tolist() == [
-        False,
-        True,
-        False,
-    ]
+    assert batch["in_batch_positive_mask"].tolist() == [[False, False], [False, False]]
+    assert batch["in_batch_candidate_mask"][0, 1].tolist() == [False, True, True]
+    assert batch["in_batch_candidate_mask"][1, 0].tolist() == [False, True, False]
 
 
-def test_raw_document_metadata_does_not_change_joint_candidate_filtering():
-    raw = [
-        {
-            "query": "q1",
-            "document": ["alpha", "beta"],
-            "ranking": [1, 2],
-            "pos_index": 1,
-            "source": "source",
-        },
-        {
-            "query": "q2",
-            "document": ["gamma", "delta"],
-            "ranking": [1, 2],
-            "pos_index": 1,
-            "source": "source",
-        },
-    ]
-    plain = [normalize_listwise_record(record) | {"source": "source"} for record in raw]
-    with_ids = [
-        normalize_listwise_record(
-            {
-                **record,
-                "document_ids": ["shared", f"negative-{index}"],
-                "document_keys": [f"positive-{index}", f"negative-{index}"],
-                "known_document_ids": ["shared"],
-                "known_positive_keys": [f"positive-{index}"],
-            },
-            preserve_document_metadata=True,
-        )
-        | {"source": "source"}
-        for index, record in enumerate(raw)
-    ]
-
-    expected = collator()(plain)
-    actual = collator()(with_ids)
-    torch.testing.assert_close(
-        actual["in_batch_positive_mask"], expected["in_batch_positive_mask"]
+def test_known_document_ids_filter_without_relabeling_and_are_source_scoped():
+    first = candidate_record(
+        ["a", "b"], document_ids=["a", "b"], known_document_ids=["a", "b", "c"]
     )
-    torch.testing.assert_close(
-        actual["in_batch_candidate_mask"], expected["in_batch_candidate_mask"]
-    )
-
-
-def test_mined_records_keep_all_known_positives_and_do_not_rank_negatives():
-    first = record_to_slate(
-        {
-            "query": "q",
-            "pos": ["chosen", "Other Positive"],
-            "pos_scores": [2.0, 1.0],
-            "neg": ["n1", "n2"],
-            "neg_scores": [0.9, 0.1],
-        },
-        slate_size=3,
-        rng=random.Random(42),
-    )
-    second = record_to_slate(
-        {
-            "query": "r",
-            "pos": [" other   positive "],
-            "neg": ["n3", "n4"],
-        },
-        slate_size=3,
-        rng=random.Random(42),
-    )
-    first["source"] = second["source"] = "nq"
-
+    second = candidate_record(["c", "d"], document_ids=["c", "d"])
     batch = collator()([first, second])
-    assert batch["relevance_labels"].tolist() == [[1, 0, 0], [1, 0, 0]]
-    assert batch["rank_labels"].tolist() == [[1, 0, 0], [1, 0, 0]]
-    assert batch["in_batch_positive_mask"].tolist() == [
-        [False, False],
-        [True, False],
+    assert batch["in_batch_candidate_mask"][0, 1].tolist() == [False, True]
+    assert batch["positive_mask"].tolist() == [[True, False], [True, False]]
+    second["source"] = "another-task"
+    assert collator()([first, second])["in_batch_candidate_mask"][0, 1].tolist() == [
+        True,
+        True,
     ]
 
-    scores = torch.tensor([[0.2, 0.7, -0.4]])
-    expected = compute_ranknet_loss(scores, batch["rank_labels"][:1])
-    actual = compute_ranknet_loss(scores[:, [0, 2, 1]], batch["rank_labels"][:1])
-    torch.testing.assert_close(actual, expected)
-    with pytest.raises(ValueError, match="binary relevance"):
-        collator("graded")([first, second])
 
-
-def test_prepared_records_use_precomputed_document_identity():
-    record = {
-        "schema": "embedding_candidates_v2",
-        "source": "source",
-        "query": "query",
-        "document": ["positive", "negative"],
-        "document_ids": ["p", "n"],
-        "document_keys": ["positive-key", "negative-key"],
-        "known_document_ids": ["p"],
-        "known_positive_keys": ["positive-key"],
-        "relevance": [1, 0],
-        "graded_relevance": [3, 0],
-        "rank_labels": [2, 1],
-    }
-    with patch(
-        "reler.data.embedding.document_key",
-        side_effect=AssertionError(
-            "prepared records must not hash text at collation time"
-        ),
-    ):
-        batch = collator()([record])
-    assert batch["candidate_mask"].tolist() == [[True, True]]
-    assert batch["positive_mask"].tolist() == [[True, False]]
+def test_candidate_order_and_full_length_are_preserved():
+    record = candidate_record([f"document {i}" for i in range(23)])
+    layout = build_candidate_layout([record], relevance_scheme="graded")
+    assert layout.positive_documents + layout.negative_documents == record["document"]
+    assert layout.ordered_document_keys == [record["document_keys"]]
+    assert layout.ordered_document_ids == [record["document_ids"]]
+    assert layout.batch["candidate_mask"].sum() == 23
 
 
 @pytest.mark.parametrize("objective", ["supervised", "grpo"])
 def test_variable_slates_encode_only_real_candidates(objective):
     records = [
-        normalize_listwise_record(
-            {
-                "query": "q1",
-                "document": ["a", "b"],
-                "ranking": [1, 2],
-                "pos_index": 1,
-            }
-        ),
-        normalize_listwise_record(
-            {
-                "query": "q2",
-                "document": ["c", "d", "e", "f"],
-                "ranking": [3, 1, 4, 2],
-                "pos_index": 3,
-            }
+        candidate_record(["a", "b"], query="q1"),
+        candidate_record(
+            ["c", "d", "e", "f"],
+            query="q2",
+            relevance=[1, 1, 0, 0],
+            rank_labels=[4, 3, 1, 2],
         ),
     ]
     batch = collator()(records)

@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from candidate_helpers import candidate_record, document_key
 
-from reler.data.embedding import document_key
 from reler.data.protocol import (
     EMBEDDING_PROTOCOL_FILENAME,
     POOLING_COMPUTE_DTYPE,
@@ -191,28 +191,17 @@ def test_build_corpus_deduplicates_and_encodes_multiple_shards(tmp_path):
     assert all(np.load(path).dtype == np.float16 for path in shards)
 
 
-def test_build_corpus_accepts_raw_reler_candidate_schemas(tmp_path):
+def test_build_corpus_uses_prepared_keys_across_source_local_ids(tmp_path):
     source = tmp_path / "training.jsonl"
-    source.write_text(
-        "\n".join(
-            json.dumps(value)
-            for value in (
-                {
-                    "query": "q1",
-                    "document": ["alpha", "beta"],
-                    "document_ids": ["a", "b"],
-                    "ranking": [1, 2],
-                },
-                {"query": "q2", "pos": ["gamma"], "neg": ["delta"]},
-            )
-        )
-        + "\n"
-    )
+    source.write_text("\n".join(json.dumps(value) for value in (
+        candidate_record(["alpha", "beta"], source="first"),
+        candidate_record(["gamma", "delta"], source="second"),
+        candidate_record(["alpha", "delta"], source="third"),
+    )) + "\n")
     corpus_dir = tmp_path / "corpus"
-
     assert build_corpus(source, corpus_dir) == 4
     mapping = json.loads((corpus_dir / DOCUMENT_MAPPING_FILENAME).read_text())
-    assert {"a", "b", document_key("gamma"), document_key("delta")} == set(mapping)
+    assert {document_key(text) for text in ["alpha", "beta", "gamma", "delta"]} == set(mapping)
 
 
 def test_builder_publishes_only_the_runtime_directory(tmp_path, monkeypatch):

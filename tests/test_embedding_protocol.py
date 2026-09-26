@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from candidate_helpers import candidate_record
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
@@ -18,7 +19,7 @@ from transformers import (
 )
 
 from reler.config import ModelArguments
-from reler.data.embedding import EmbeddingDataCollator, document_key
+from reler.data.embedding import EmbeddingDataCollator
 from reler.data.protocol import (
     load_embedding_protocol,
     pool_embeddings,
@@ -45,11 +46,10 @@ def tokenizer(kind="embedding", padding_side="left"):
 
 def test_strong_cl_metadata_preserves_collator_false_negative_filters():
     collator = EmbeddingDataCollator(tokenizer=tokenizer(), include_cross_batch_metadata=True)
-    records = [dict(query='word', document=['word', 'other'], ranking=[1, 2], pos_index=1, source='s',
-                    document_ids=['a', 'b'], original_relevant_docids=['c']),
-               dict(query='other', document=['word word', 'word other', 'other word'],
-                    ranking=[1, 2, 3], pos_index=1, source='s', document_ids=['c', 'd', 'e'],
-                    known_positive_keys=[document_key('other')])]
+    records = [candidate_record(['word', 'other'], query='word', source='s',
+                                document_ids=['a', 'b'], known_document_ids=['a', 'b', 'c']),
+               candidate_record(['word word', 'word other', 'other word'], query='other',
+                                source='s', document_ids=['c', 'd', 'e'])]
     batch = collator(records)
     assert batch['candidate_mask'].tolist() == [[True, True, False], [True, True, True]]
     _, valid, _ = cross_query_scores(torch.randn(2, 5), torch.randn(2, 3, 5), batch['cross_batch_metadata'],
@@ -103,8 +103,7 @@ def tiny_model():
 def test_training_mteb_and_native_embedding_agree():
     tok, model = tokenizer(), tiny_model()
     texts = ["word", "word other word other word"]
-    records = [dict(query=text, document=["word", "word other word other word"],
-                    ranking=[1, 2], pos_index=1) for text in texts]
+    records = [candidate_record(["word", "word other word other word"], query=text) for text in texts]
     training = EmbeddingDataCollator(tok, query_max_length=4, doc_max_length=4)(records)
     with patch("reler.evaluation.qwen3_embedding_model.AutoModel.from_pretrained", return_value=model), \
          patch("reler.evaluation.qwen3_embedding_model.AutoTokenizer.from_pretrained", return_value=tok):

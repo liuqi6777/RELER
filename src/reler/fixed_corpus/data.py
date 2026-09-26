@@ -51,18 +51,18 @@ class FixedCorpusDataCollator:
         self.document_to_ordinal = index.document_to_ordinal
 
     def __call__(self, instances: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+        layout = build_candidate_layout(
+            instances,
+            relevance_scheme=self.relevance_scheme,
+            include_cross_batch_metadata=self.include_cross_batch_metadata,
+        )
         query_inputs = tokenize_embedding_texts(
             [instance["query"] for instance in instances],
             self.tokenizer,
             self.append_token,
             max_length=self.query_max_length,
         )
-        layout = build_candidate_layout(
-            instances,
-            relevance_scheme=self.relevance_scheme,
-            include_cross_batch_metadata=self.include_cross_batch_metadata,
-            use_unprepared_document_metadata=True,
-        )
+
         candidate_mask = layout.batch["candidate_mask"]
         ordinals = torch.full_like(candidate_mask, -1, dtype=torch.long)
         missing: list[tuple[int, int, object, str]] = []
@@ -102,8 +102,7 @@ class FixedCorpusDataCollator:
             raise KeyError(
                 "Frozen corpus does not contain candidate document ID or key: "
                 f"{preview}. Rebuild the index from this corpus or provide matching "
-                "document_ids/document_keys. Legacy records without document_keys use "
-                "the RELER normalized-text key."
+                "document_ids/document_keys."
             )
         return {
             "query": query_inputs,

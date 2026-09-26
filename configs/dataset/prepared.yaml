@@ -1,0 +1,10 @@
+# Prepared embedding_candidates_v2 JSONL; candidate lists are preserved in full.
+data_path: data/train.ready.jsonl
+per_dataset_max_samples: null
+q_max_len: 512
+d_max_len: 1024
+relevance_scheme: graded
+file_glob: "*.jsonl"
+batch_per_length_bucket: false
+include_sources: null
+index_cache_dir: .cache/dataset_index

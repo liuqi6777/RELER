@@ -274,8 +274,6 @@ def build_embedding_dataset(
     data_args: DataArguments,
     training_args: HFTrainingArguments,
     model_args: ModelArguments | None = None,
-    *,
-    preserve_document_metadata: bool = False,
 ):
     """Build the training dataset with the stable data seed."""
     data_seed = getattr(training_args, "data_seed", None)
@@ -287,7 +285,6 @@ def build_embedding_dataset(
         query_prompt_template=(
             model_args.query_prompt_template if model_args else None
         ),
-        preserve_document_metadata=preserve_document_metadata,
     )
 
 

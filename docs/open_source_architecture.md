@@ -9,7 +9,7 @@ it changes ownership and public interfaces before changing any numerical code.
 The first open-source release includes:
 
 - shared-weight query/document embedding training;
-- E2Rank listwise and `query`/`pos`/`neg` training data;
+- prepared `embedding_candidates_v2` training data;
 - InfoNCE, RankNet, and LambdaLoss supervised objectives;
 - the current GRPO objective, including score-function and conditional-projection
   estimators, shortlist rewards, and cross-query document policies;
@@ -37,7 +37,8 @@ src/reler/
     arguments.py             # model, data, training, and objective schemas
     loader.py                # YAML composition and CLI overrides
   data/
-    embedding.py             # validation, lazy reads, sampling, and collation
+    candidates.py            # shared prepared-record validation
+    embedding.py             # lazy reads, source batching, and collation
     protocol.py              # text formatting, pooling, and checkpoint metadata
   fixed_corpus/
     build.py                 # immutable corpus encoder and directory builder
@@ -81,7 +82,8 @@ fixed_corpus.training -> {training, config, data, fixed_corpus.index}
 evaluation.fixed_corpus -> data.protocol
 config.arguments -> {data.protocol, objective validators}
 objectives -> {numerical helpers inside objectives}
-data.embedding -> data.protocol
+data.embedding -> {data.candidates, data.protocol}
+fixed_corpus.build -> {data.candidates, data.protocol}
 ```
 
 `training/common.py` must not import a corpus index, RAG module, or experiment
@@ -93,8 +95,8 @@ stack, while ordinary training and objective modules remain unaware of it.
 The following properties define algorithmic compatibility and must be covered by
 regression tests before the old modules are removed.
 
-1. E2Rank `ranking` remains a one-based permutation. Its conversion to rank and
-   graded-relevance labels must remain byte-for-byte equivalent for the same row.
+1. Prepared candidate order, binary labels, teacher grades, and higher-is-better
+   rank labels are preserved without conversion or candidate sampling.
 2. The annotated positive used by contrastive learning remains independent of
    teacher grades. Known positives must still be excluded from negative pools.
 3. Query/document prompt rendering, padding side, terminal-token insertion,
@@ -109,9 +111,9 @@ regression tests before the old modules are removed.
 8. `embedding_protocol.json` keeps its current fields and evaluation semantics.
 
 Fixed-corpus training uses a deliberately small directory contract: vector shards,
-the document-to-ordinal mapping, and `embedding_protocol.json` must agree. The
-text-derived key used for records without explicit document IDs remains the same
-key used by known-positive filtering.
+the document-to-ordinal mapping, and `embedding_protocol.json` must agree. Prepared
+text keys identify documents across sources; source-scoped IDs and known-document
+sets also filter cross-query candidates without changing binary positive labels.
 
 ## Migration sequence
 

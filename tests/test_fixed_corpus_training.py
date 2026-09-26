@@ -4,10 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from candidate_helpers import candidate_record, document_key
 from torch import nn
 
 from reler.config import RLArguments
-from reler.data.embedding import document_key, normalize_listwise_record
+from reler.data.embedding import EmbeddingDataCollator
 from reler.fixed_corpus.data import FixedCorpusDataCollator
 from reler.fixed_corpus.training import (
     FixedCorpusGRPOModel,
@@ -66,42 +67,29 @@ class MemoryIndex:
 def test_fixed_collator_preserves_joint_candidate_layout_without_document_tokens():
     index = MemoryIndex()
     collator = FixedCorpusDataCollator(ToyTokenizer(), index, append_token="none")
-    first = normalize_listwise_record(
-        {
-            "query": "q1",
-            "document": ["negative", "positive"],
-            "ranking": [1, 2],
-            "pos_index": 2,
-            "document_keys": ["negative", "positive"],
-            "document_ids": ["n", "p"],
-        },
-        preserve_document_metadata=True,
+    first = candidate_record(
+        ["positive", "negative"], query="q1", rank_labels=[1, 2],
+        document_keys=["positive", "negative"], document_ids=["p", "n"],
     )
-    second = {
-        "query": "q2",
-        "document": ["positive", "other"],
-        "ranking": [1, 2],
-        "pos_index": 1,
-    }
+    second = candidate_record(["positive", "other", "negative"], query="q2",
+                              relevance=[1, 1, 0])
     batch = collator([first, second])
 
-    assert batch["candidate_ordinals"].tolist() == [[0, 1], [0, 2]]
-    assert batch["candidate_mask"].tolist() == [[True, True], [True, True]]
-    assert batch["positive_mask"].tolist() == [[True, False], [True, False]]
+    assert batch["candidate_ordinals"].tolist() == [[0, 1, -1], [0, 2, 1]]
+    assert batch["candidate_mask"].tolist() == [[True, True, False], [True, True, True]]
+    assert batch["positive_mask"].tolist() == [[True, False, False], [True, True, False]]
+    joint = EmbeddingDataCollator(ToyTokenizer(), append_token="none")([first, second])
+    for field in ("candidate_mask", "positive_mask", "relevance_labels", "rank_labels",
+                  "in_batch_positive_mask", "in_batch_candidate_mask"):
+        torch.testing.assert_close(batch[field], joint[field])
     assert "positive_document" not in batch and "negative_document" not in batch
 
 
 def test_fixed_collator_prefers_explicit_document_ids_and_rejects_ambiguity():
     index = MemoryIndex()
     collator = FixedCorpusDataCollator(ToyTokenizer(), index, append_token="none")
-    record = {
-        "query": "q",
-        "document": ["positive", "negative"],
-        "ranking": [1, 2],
-        "pos_index": 1,
-        "document_ids": ["p", "n"],
-        "document_keys": ["unknown-key", "also-unknown"],
-    }
+    record = candidate_record(document_ids=["p", "n"],
+                              document_keys=["unknown-key", "also-unknown"])
     assert collator([record])["candidate_ordinals"].tolist() == [[0, 1]]
 
     index.document_to_ordinal["p"] = 2
@@ -121,12 +109,7 @@ def test_fixed_collator_rejects_candidates_missing_from_the_index():
     collator = FixedCorpusDataCollator(
         ToyTokenizer(), MemoryIndex(), append_token="none"
     )
-    record = {
-        "query": "q",
-        "document": ["positive", "outside"],
-        "ranking": [1, 2],
-        "pos_index": 1,
-    }
+    record = candidate_record(["positive", "outside"])
     with pytest.raises(KeyError):
         collator([record])
 

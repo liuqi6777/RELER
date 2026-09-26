@@ -15,7 +15,7 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from reler.config.loader import load_raw_config_file
-from reler.data.embedding import document_key
+from reler.data.candidates import validate_candidate_record
 from reler.data.protocol import (
     EMBEDDING_PROTOCOL_FILENAME,
     POOLING_COMPUTE_DTYPE,
@@ -56,41 +56,14 @@ def _iter_source_documents(
             if not line.strip():
                 continue
             try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
+                record = validate_candidate_record(json.loads(line))
+            except ValueError as exc:
                 raise ValueError(
-                    f"Invalid JSON at {source_path}:{line_number}"
+                    f"Invalid training record at {source_path}:{line_number}: {exc}"
                 ) from exc
-            documents = record.get("document")
-            if documents is None and (record.get("pos") or record.get("neg")):
-                documents = [*(record.get("pos") or []), *(record.get("neg") or [])]
-            if not isinstance(documents, list) or not documents:
-                raise ValueError(
-                    f"Candidate document list missing at {source_path}:{line_number}"
-                )
-            document_ids = record.get("document_ids")
-            keys = (
-                document_ids
-                if isinstance(document_ids, list)
-                and len(document_ids) == len(documents)
-                and all(value not in (None, "") for value in document_ids)
-                else record.get("document_keys")
-            )
-            if keys is None:
-                keys = [
-                    document_key(text) if isinstance(text, str) else None
-                    for text in documents
-                ]
-            if not isinstance(keys, list) or len(documents) != len(keys):
-                raise ValueError(
-                    f"Candidate text/key mismatch at {source_path}:{line_number}"
-                )
-            for text, key in zip(documents, keys):
-                if key in (None, ""):
-                    raise ValueError(
-                        f"Candidate key missing at {source_path}:{line_number}"
-                    )
-                yield str(key), text, line_number
+            # IDs are local to a source; prepared text keys are shared across sources.
+            for text, key in zip(record["document"], record["document_keys"]):
+                yield key, text, line_number
 
 
 def build_corpus(

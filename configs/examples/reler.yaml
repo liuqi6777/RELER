@@ -1,7 +1,7 @@
 # Joint embedding training with own-query candidates and graded nDCG + pairwise.
 _base_:
   - ../train/full_finetune.yaml
-  - ../dataset/e2rank_listwise.yaml
+  - ../dataset/prepared.yaml
   - ../model/qwen3_embedding_0.6b.yaml
   - ../grpo/default.yaml
   - ../reward/ndcg_in_batch_all.yaml

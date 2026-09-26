@@ -1,7 +1,7 @@
 # Query-only RELER GRPO with immutable document embeddings.
 _base_:
   - ../train/full_finetune.yaml
-  - ../dataset/e2rank_listwise.yaml
+  - ../dataset/prepared.yaml
   - ../model/qwen3_embedding_0.6b.yaml
   - ../grpo/query_only.yaml
   - ../reward/ndcg_listwise_in_batch.yaml

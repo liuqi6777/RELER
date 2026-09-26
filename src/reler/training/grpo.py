@@ -98,11 +98,10 @@ def main(argv: list[str] | None = None) -> None:
         or (rl_args.aux_infonce_coef > 0 and rl_args.aux_infonce_strong_negatives)
     )
 
-    # Both halves of this check live in different config slots -- the cutoff in reward/, the
-    # slate in dataset/ -- so nothing else notices when a change to one invalidates the other.
+    # Warn only when the cutoff covers even the longest retained candidate list.
     for warning in warn_on_inert_cutoffs(
         model.grpo.reward_terms,
-        slate_size=data_args.slate_size,
+        slate_size=train_dataset.max_slate_size,
         batch_size=training_args.per_device_train_batch_size,
     ):
         logger.warning(warning)
